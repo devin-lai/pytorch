@@ -2269,6 +2269,7 @@ class StatelessSymbolicContext(SymbolicContext, Generic[_P1, _T1]):
     shape_ids: dict[int, str | None] | None = None
     # Maps dimension index to (min, max) bounds for unbacked dimensions.
     unbacked_bounds: dict[int, tuple[int | None, int | None]] | None = None
+    do_not_specialize_zero_one: DimList[bool] = None  # type: ignore[assignment]
     # TODO: add storage offset and stride symbolic_context
 
     def __post_init__(self) -> None:
@@ -2291,6 +2292,10 @@ class StatelessSymbolicContext(SymbolicContext, Generic[_P1, _T1]):
         if self.constraint_strides is None:
             object.__setattr__(
                 self, "constraint_strides", [None] * len(self.dynamic_sizes)
+            )
+        if self.do_not_specialize_zero_one is None:
+            object.__setattr__(
+                self, "do_not_specialize_zero_one", [False] * len(self.dynamic_sizes)
             )
         if not all(
             stride in (DimDynamic.INFER_STRIDE, DimDynamic.DYNAMIC, DimDynamic.DUCK)
@@ -4709,7 +4714,10 @@ class ShapeEnv:
                 TensorPropertySource(source, TensorProperty.SIZE, i),
                 dynamic_dims[i],
                 constraint_dims[i],
-                do_not_specialize_zero_one=config.backed_size_oblivious,
+                do_not_specialize_zero_one=(
+                    config.backed_size_oblivious
+                    or symbolic_context.do_not_specialize_zero_one[i]  # type: ignore[attr-defined]
+                ),
                 symbolic_context=symbolic_context,
             )
             if (
@@ -4739,6 +4747,9 @@ class ShapeEnv:
         # not-all check in produce_guards_verbose to emit a guard that
         # immediately fails.
         excluded_sizes = getattr(symbolic_context, "excluded_sizes", None)
+        do_not_specialize_zero_one = getattr(
+            symbolic_context, "do_not_specialize_zero_one", None
+        )
         dim = len(tensor_size)
         if (
             excluded_sizes
@@ -4751,6 +4762,11 @@ class ShapeEnv:
                     ev is not None
                     and isinstance(size[i], sympy.Symbol)
                     and i not in (hint_overrides or {})
+                    and not (
+                        do_not_specialize_zero_one
+                        and len(do_not_specialize_zero_one) == dim
+                        and do_not_specialize_zero_one[i]
+                    )
                 ):
                     self._record_exclusion_constraint(size[i], ev)
         return size
@@ -5647,8 +5663,11 @@ class ShapeEnv:
 
             if isinstance(val, int):
                 if positive:
-                    # Add assertions for the newly created symbols
-                    self._add_assertion(sympy_expr > 1)
+                    if do_not_specialize_zero_one:
+                        self._add_assertion(sympy_expr >= 0)
+                    else:
+                        # Add assertions for the newly created symbols
+                        self._add_assertion(sympy_expr > 1)
 
                     # Apply default range, which assumes not zero-one
                     self.var_to_range[sympy_expr] = self._default_value_range(
@@ -6441,8 +6460,22 @@ class ShapeEnv:
         #    like s0 == s1*2 because trivial due to simplification)
         issued = set()
 
+        def guard_excludes_valid_zero_one(expr: sympy.Expr) -> bool:
+            if expr.func is not sympy.Ne:
+                return False
+            lhs, rhs = expr.args
+            if isinstance(rhs, sympy.Symbol):
+                lhs, rhs = rhs, lhs
+            if not isinstance(lhs, sympy.Symbol) or rhs not in (0, 1):
+                return False
+            vr = self.var_to_range.get(lhs)
+            return vr is not None and rhs in vr
+
         def issue_guard(guard: ShapeGuard) -> None:
             expr = self.simplify(guard.expr)
+
+            if guard_excludes_valid_zero_one(expr):
+                return
 
             # Avoid re-issuing the same guard.
             if expr in issued:
@@ -6671,6 +6704,7 @@ class ShapeEnv:
                 (sym, val)
                 for sym, val in self.exclusion_constraints
                 if symbol_to_source.get(sym)
+                and (sym not in self.var_to_range or val not in self.var_to_range[sym])
             ]
             if all_pairs and not all(
                 self.backed_var_to_val.get(sym) == val for sym, val in all_pairs

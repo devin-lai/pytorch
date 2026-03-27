@@ -1871,7 +1871,7 @@ def register_fast_op_impl(
 def infer_size(
     a: Sequence[IntLikeType], b: Sequence[IntLikeType]
 ) -> tuple[IntLikeType, ...]:
-    from torch.fx.experimental.symbolic_shapes import guard_or_false
+    from torch.fx.experimental.symbolic_shapes import guard_or_false, statically_known_true
 
     dimsA = len(a)
     dimsB = len(b)
@@ -1895,13 +1895,23 @@ def infer_size(
         # expression of an or statement as-is, without bool()'ing it; if this
         # were not the case, we'd need to write this using torch.sym_or() or
         # something like that).
-        torch._check(
-            guard_or_false(sizeA == 1) or guard_or_false(sizeB == 1) or sizeA == sizeB,
-            lambda: f"The size of tensor a ({sizeA}) "
-            f"must match the size of tensor b ({sizeB}) "
-            f"at non-singleton dimension {i})",
-        )
-        expandedSizes[i] = sizeB if guard_or_false(sizeA == 1) else sizeA
+        size_a_is_one = statically_known_true(sizeA == 1)
+        size_b_is_one = statically_known_true(sizeB == 1)
+        if not (size_a_is_one or size_b_is_one):
+            torch._check(
+                guard_or_false(sizeA == 1)
+                or guard_or_false(sizeB == 1)
+                or sizeA == sizeB,
+                lambda: f"The size of tensor a ({sizeA}) "
+                f"must match the size of tensor b ({sizeB}) "
+                f"at non-singleton dimension {i})",
+            )
+        if size_a_is_one:
+            expandedSizes[i] = sizeB
+        elif size_b_is_one:
+            expandedSizes[i] = sizeA
+        else:
+            expandedSizes[i] = sizeB if guard_or_false(sizeA == 1) else sizeA
     return tuple(expandedSizes)
 
 
