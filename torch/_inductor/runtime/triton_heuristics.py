@@ -717,6 +717,7 @@ class CachingAutotuner(KernelInterface):
             and bool(device_prop.major)
             and (device_prop.major >= 8 or torch.version.hip)
             and device_prop.regs_per_multiprocessor is not None
+            and device_prop.warp_size is not None
         )
 
     def _iter_rblock_scale_candidates(self):
@@ -730,8 +731,9 @@ class CachingAutotuner(KernelInterface):
         assert device_prop.regs_per_multiprocessor
         assert device_prop.max_threads_per_multi_processor
         assert device_prop.multi_processor_count
+        assert device_prop.warp_size is not None
         seen_config_hashes: OrderedSet[Hashable] | None = None
-        warp_size = device_prop.warp_size or 32
+        warp_size = device_prop.warp_size
         for result in self.compile_results:
             triton_config = result.config
             compiled_binary = result.kernel
