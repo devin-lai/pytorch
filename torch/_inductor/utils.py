@@ -3194,11 +3194,10 @@ def get_max_numwarps() -> int:
         warp_size = torch.cuda.get_device_properties().warp_size
         # pyrefly: ignore [missing-attribute]
         max_threads_per_block = torch.cuda.get_device_properties().max_threads_per_block
-    else:
-        # Defaults
-        warp_size = 32
-        max_threads_per_block = 1024
-    return max_threads_per_block // warp_size
+        return max_threads_per_block // warp_size
+
+    log.debug("CUDA is not available; defaulting max num warps to 32")
+    return 32
 
 
 def is_welford_reduction(reduction_type: str) -> bool:
