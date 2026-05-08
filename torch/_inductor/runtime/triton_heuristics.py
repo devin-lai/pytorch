@@ -3276,13 +3276,19 @@ def _num_warps(num_warps, max_num_warps=8, min_num_warps=2, register_intensive=F
     return next_power_of_2(min(max(num_warps, min_num_warps), max_num_warps))
 
 
+def _get_current_warp_size() -> int:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).warp_size
+
+    # Fallback only for tests/import paths where no device is available.
+    return 64 if torch.version.hip else 32
+
+
 def _check_max_grid_x(size_hints, x, num_warps):
     # Check if maxGridSize is exceeded - if so then must scale XBLOCK further
     max_grid_x = 2147483647
     max_block_x = TRITON_MAX_BLOCK["X"]
-    warp_size = (
-        64 if torch.version.hip else 32
-    )  # TODO: query warp size once #129663 is merged
+    warp_size = _get_current_warp_size()
     num_blocks = (size_hints["x"] + x - 1) // x
 
     if torch.version.hip:
