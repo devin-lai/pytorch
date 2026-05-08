@@ -196,6 +196,13 @@ def autotune_hints_to_configs(
     configs: list[Config] = []
     for hint in hints:
         if hint == AutotuneHint.ONE_ELEMENT_PER_THREAD:
+            if device_props.warp_size is None:
+                log.debug(
+                    "Skipping %s autotune hint because device %s does not report warp_size",
+                    AutotuneHint.ONE_ELEMENT_PER_THREAD,
+                    device_props.type,
+                )
+                continue
             if len(size_hints) == 1:
                 xyz_options = ((block_size // 4, None, None),)
             elif len(size_hints) == 2:
@@ -210,9 +217,7 @@ def autotune_hints_to_configs(
                 triton_config(
                     size_hints,
                     *xyz,
-                    num_elements_per_warp=(
-                        device_props.warp_size if device_props.warp_size else 32
-                    ),
+                    num_elements_per_warp=device_props.warp_size,
                 )
                 for xyz in xyz_options
             )
