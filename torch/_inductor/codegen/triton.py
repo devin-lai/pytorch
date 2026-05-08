@@ -6828,7 +6828,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # faults on AMD hardware.  Keep the dynamic mask so that all
             # hardware stays correct.
             device = V.graph.get_current_device_or_throw()
-            warp_size = DeviceProperties.create(device).warp_size or 32
+            warp_size = DeviceProperties.create(device).warp_size
+            if warp_size is None:
+                return False
             if isinstance(max_block, int) and max_block < warp_size:
                 return False
         elif tree.prefix == "x" and self.no_x_dim:
