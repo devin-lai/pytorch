@@ -200,7 +200,7 @@ class DeviceProperties(typing.NamedTuple):
                 props, "max_threads_per_multi_processor", None
             ),
             max_threads_per_block=getattr(props, "max_threads_per_block", 1024),
-            warp_size=getattr(props, "warp_size", 32 if device_type != "cpu" else None),
+            warp_size=getattr(props, "warp_size", None),
         )
 
 
