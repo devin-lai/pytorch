@@ -1140,10 +1140,14 @@ class CachingAutotuner(KernelInterface):
         else:
             arch = compile_meta["cc"]
 
+        warp_size = self.device_props.warp_size
+        if warp_size is None:
+            warp_size = cc_warp_size(compile_meta["cc"])
+
         target = GPUTarget(
             compile_meta["device_type"],
             arch,
-            cc_warp_size(compile_meta["cc"]),
+            warp_size,
         )
 
         options = self._create_compile_options(cfg, compile_meta)
