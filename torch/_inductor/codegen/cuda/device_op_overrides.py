@@ -55,6 +55,11 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
     def kernel_driver(self) -> str:
         """Return C++ host-side helpers (loadKernel, launchKernel, CUDA_DRIVER_CHECK)
         embedded in AOTI-generated wrapper code."""
+        warp_size = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).warp_size
+            if torch.cuda.is_available()
+            else 32
+        )
         source_codes = """
             #define CUDA_DRIVER_CHECK(EXPR)                    \\
             do {                                               \\
@@ -134,16 +139,10 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
                     void* args[],
                     cudaStream_t stream) {
                 CUDA_DRIVER_CHECK(cuLaunchKernel(
-                    func, gridX, gridY, gridZ, 32*numWarps, 1, 1, sharedMemBytes, stream, args, nullptr
+                    func, gridX, gridY, gridZ, {warp_size}*numWarps, 1, 1, sharedMemBytes, stream, args, nullptr
                 ));
             }
-        """
-        if torch.version.hip is not None:
-            # Adjusting the warp size to GPU supported wavefront size on AMD GPU
-            prop = torch.cuda.get_device_properties(torch.cuda.current_device())
-            source_codes = source_codes.replace(
-                "32*numWarps", str(prop.warp_size) + "*numWarps"
-            )
+        """.format(warp_size=warp_size)
         return source_codes
 
     def tma_descriptor_helpers(self) -> str:
