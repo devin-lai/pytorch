@@ -72,6 +72,84 @@ def _sanitize_kernel_options_for_triton(
     return sanitized, backend
 
 
+def _prune_unused_subgraph_buffers(
+    graph_module: torch.fx.GraphModule,
+    num_fixed_placeholders: int,
+    other_buffers: Sequence[Any],
+) -> list[Any]:
+    """Drop captured buffers whose corresponding subgraph placeholder is dead.
+
+    The HOP capture list is positional: placeholder N corresponds to buffer N.
+    If graph simplification deletes a captured placeholder, keep that invariant
+    by deleting the matching buffer. This is intentionally liveness-only: live
+    captures are preserved regardless of whether they are tensors, backed
+    symbols, unbacked symbols, or plain Python scalars.
+    """
+    placeholders = [
+        node for node in graph_module.graph.nodes if node.op == "placeholder"
+    ]
+    captured_placeholders = placeholders[num_fixed_placeholders:]
+    assert len(captured_placeholders) == len(other_buffers), (
+        f"Expected {len(captured_placeholders)} captured buffers for "
+        f"{graph_module}, got {len(other_buffers)}"
+    )
+
+    kept: list[Any] = []
+    changed = False
+    for placeholder, buffer in zip(captured_placeholders, other_buffers):
+        if placeholder.users:
+            kept.append(buffer)
+            continue
+        graph_module.graph.erase_node(placeholder)
+        changed = True
+
+    if changed:
+        graph_module.graph.lint()
+        graph_module.recompile()
+    return kept
+
+
+def _prune_unused_score_mod_buffers(
+    fw_graph_module: torch.fx.GraphModule,
+    joint_graph_module: torch.fx.GraphModule,
+    other_buffers: Sequence[Any],
+) -> list[Any]:
+    """Drop score_mod captures only when both forward and joint graphs drop them."""
+    fw_placeholders = [
+        node for node in fw_graph_module.graph.nodes if node.op == "placeholder"
+    ][5:]
+    joint_placeholders = [
+        node for node in joint_graph_module.graph.nodes if node.op == "placeholder"
+    ][6:]
+    assert len(fw_placeholders) == len(joint_placeholders) == len(other_buffers), (
+        "Expected the forward and joint score_mod graphs to have matching "
+        f"captured buffers, got {len(fw_placeholders)}, "
+        f"{len(joint_placeholders)}, and {len(other_buffers)}"
+    )
+
+    kept: list[Any] = []
+    fw_changed = False
+    joint_changed = False
+    for fw_placeholder, joint_placeholder, buffer in zip(
+        fw_placeholders, joint_placeholders, other_buffers
+    ):
+        if fw_placeholder.users or joint_placeholder.users:
+            kept.append(buffer)
+            continue
+        fw_graph_module.graph.erase_node(fw_placeholder)
+        joint_graph_module.graph.erase_node(joint_placeholder)
+        fw_changed = True
+        joint_changed = True
+
+    if fw_changed:
+        fw_graph_module.graph.lint()
+        fw_graph_module.recompile()
+    if joint_changed:
+        joint_graph_module.graph.lint()
+        joint_graph_module.recompile()
+    return kept
+
+
 @SymbolicGridFn
 def flex_attention_grid(batch_size, q_heads, num_queries, d_model, meta, *, cdiv):
     """How is this kernel parallelized?
@@ -181,6 +259,13 @@ def flex_attention(
         SPARSE_KV_BLOCK_SIZE,
         mask_graph,
     ) = block_mask
+
+    score_mod_other_buffers = _prune_unused_subgraph_buffers(
+        subgraph.graph_module, 5, score_mod_other_buffers
+    )
+    mask_mod_other_buffers = _prune_unused_subgraph_buffers(
+        mask_graph.graph_module, 4, mask_mod_other_buffers
+    )
 
     kernel_options, backend = _sanitize_kernel_options_for_triton(kernel_options)
 
@@ -687,6 +772,10 @@ def flex_attention_backward(*args, **kwargs):
         mask_graph,
     ) = block_mask
 
+    mask_mod_other_buffers = _prune_unused_subgraph_buffers(
+        mask_graph.graph_module, 4, mask_mod_other_buffers
+    )
+
     (
         query,
         key,
@@ -767,6 +856,14 @@ def flex_attention_backward(*args, **kwargs):
     else:
         kernel_options.setdefault("IS_DIVISIBLE", False)
 
+    # DCE can make some score_mod captures dead. Prune the matching positional
+    # buffers before lowering the subgraphs.
+    fw_graph.graph_module.graph.eliminate_dead_code()
+    joint_graph.graph_module.graph.eliminate_dead_code()
+    score_mod_other_buffers = _prune_unused_score_mod_buffers(
+        fw_graph.graph_module, joint_graph.graph_module, score_mod_other_buffers
+    )
+
     fwd_placeholder_inps = [
         create_placeholder(name, dtype, device)
         for name, dtype in [
@@ -785,8 +882,6 @@ def flex_attention_backward(*args, **kwargs):
     joint_placeholder_inps = fwd_placeholder_inps + [
         create_placeholder("grad_score_mod", dtype, device)
     ]
-    # Sometimes we have weird unused nodes here
-    joint_graph.graph_module.graph.eliminate_dead_code()
 
     # It is hard to raise nice errors for some joint graphs during subgraph lowering
     # This lets us do some checks before attempting to lower

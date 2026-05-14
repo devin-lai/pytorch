@@ -1304,6 +1304,7 @@ class PythonWrapperCodegen(CodeGen):
             OrderedSet()
         )  # str of sympy.Symbol
         self.computed_sizes: OrderedSet[sympy.Symbol] = OrderedSet()
+        self.input_expr_replacements: dict[sympy.Expr, sympy.Symbol] = {}
         self.launcher_fn_name = None
         # This function can be overridden to change the launcher name
         self.set_launcher_fn_name()
@@ -2359,6 +2360,7 @@ class PythonWrapperCodegen(CodeGen):
         value: ir.TensorBox,
         bound_vars: OrderedSet[sympy.Symbol],
     ):
+        """Bind symbolic graph inputs to local wrapper variables."""
         code = self.prefix
 
         @functools.cache
@@ -2391,8 +2393,33 @@ class PythonWrapperCodegen(CodeGen):
                     code.writeline(f"{src} = {sym}")
                     bound_vars.add(src)
 
+        def bind_input_expr(
+            expr: sympy.Expr,
+            symbol_name: str,
+            *,
+            source: str | None = None,
+        ) -> None:
+            if isinstance(expr, sympy.Symbol) or not expr.free_symbols:
+                return
+            if not any(
+                symbol_is_type(symbol, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT))
+                for symbol in expr.free_symbols
+            ):
+                return
+            if expr in self.input_expr_replacements:
+                bound_vars.add(self.input_expr_replacements[expr])
+                return
+            symbol = sympy.Symbol(symbol_name, integer=expr.is_integer)
+            if source is not None:
+                code.writeline(f"{symbol} = {source}")
+            self.input_expr_replacements[expr] = symbol
+            bound_vars.add(symbol)
+
         if isinstance(value, sympy.Expr):
-            if not isinstance(value, sympy.Symbol) or value in bound_vars:
+            if not isinstance(value, sympy.Symbol):
+                bind_input_expr(value, name)
+                return
+            if value in bound_vars:
                 return
             code.writeline(f"{value} = {name}")
             bound_vars.add(value)
@@ -2403,10 +2430,24 @@ class PythonWrapperCodegen(CodeGen):
                     code.writeline(f"{size} = {sizeof(name)}[{dim}]")
                     bound_vars.add(size)
                     maybe_emit_replacement_aliases(size)
+                elif isinstance(size, sympy.Expr):
+                    size_name = sizeof(name)
+                    bind_input_expr(
+                        size,
+                        f"{size_name}_{dim}",
+                        source=f"{size_name}[{dim}]",
+                    )
             for dim, stride in enumerate(value.get_stride()):
                 if isinstance(stride, sympy.Symbol) and stride not in bound_vars:
                     code.writeline(f"{stride} = {strideof(name)}[{dim}]")
                     bound_vars.add(stride)
+                elif isinstance(stride, sympy.Expr):
+                    stride_name = strideof(name)
+                    bind_input_expr(
+                        stride,
+                        f"{stride_name}_{dim}",
+                        source=f"{stride_name}[{dim}]",
+                    )
         elif isinstance(
             value, (ir.TorchBindObject, ir.GeneratorState, ir.OpaqueObjectState)
         ):
@@ -2439,6 +2480,8 @@ class PythonWrapperCodegen(CodeGen):
             bound_vars: OrderedSet[sympy.Symbol],
         ):
             for expr in chain.from_iterable([value.get_size(), value.get_stride()]):
+                if isinstance(expr, Expr):
+                    expr = sympy_subs(expr, self.input_expr_replacements)
                 if not isinstance(expr, Expr) or isinstance(expr, sympy.Symbol):
                     continue
 
@@ -2474,6 +2517,7 @@ class PythonWrapperCodegen(CodeGen):
         raise RuntimeError("codegen_cpp_sizevar is only implemented for cpp_wrapper!")
 
     def codegen_python_sizevar(self, x: Expr, *, simplify: bool = True) -> str:
+        x = sympy_subs(x, self.input_expr_replacements)
         return pexpr(x, simplify=simplify)
 
     def codegen_sizevar(self, x: Expr) -> str:
@@ -3224,7 +3268,7 @@ class PythonWrapperCodegen(CodeGen):
     def _generate_symbolic_call_arg_helper(
         self, arg: SymbolicCallArg, graph: GraphLowering
     ) -> None:
-        self.writeline(f"{arg.inner} = {pexpr(arg.inner_expr)}")
+        self.writeline(f"{arg.inner} = {self.codegen_python_sizevar(arg.inner_expr)}")
 
     def generate_workspace_allocation(self, ws: WorkspaceArg):
         name = ws.get_name()
@@ -3342,7 +3386,7 @@ class PythonWrapperCodegen(CodeGen):
             elif isinstance(arg, (int, float, bool, SymbolicCallArg)):
                 return str(arg)
             else:
-                return pexpr(V.graph.sizevars.simplify(arg))
+                return self.codegen_python_sizevar(V.graph.sizevars.simplify(arg))
 
         return [wrap_arg(arg) for arg in call_args]
 

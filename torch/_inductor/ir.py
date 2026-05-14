@@ -4084,7 +4084,11 @@ class SliceView(View):
             if val is None:
                 # TODO(rec): can this really happen?
                 return default
-            val = cls.handle_negative_index(val, dim_size)
+            if any(free_unbacked_symbols(x) for x in (val, dim_size)):
+                if V.graph.sizevars.guard_or_false(sympy.Lt(val, 0)):
+                    val = val + dim_size
+            else:
+                val = cls.handle_negative_index(val, dim_size)
             return clamp(val, lower, upper)
 
         start = clamp_wrap(start, 0, dim_size, 0)

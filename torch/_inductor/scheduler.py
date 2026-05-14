@@ -58,6 +58,7 @@ from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch._inductor.stream_utils import get_stream_name
 from torch.fx.experimental.symbolic_shapes import free_symbols
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.solve import try_solve
 from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
 from torch.utils._triton import has_triton
 
@@ -119,6 +120,79 @@ cudagraphs_log = torch._logging.getArtifactLogger(__name__, "cudagraphs")
 PartitionType: TypeAlias = list["BaseSchedulerNode"]
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
+
+
+def _unbacked_symbols(expr: sympy.Expr) -> list[sympy.Symbol]:
+    return sorted(
+        (
+            s
+            for s in expr.free_symbols
+            if symbol_is_type(s, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT))
+        ),
+        key=lambda s: s.name,
+    )
+
+
+def _origins_for_unbacked_expr(
+    expr: sympy.Expr,
+    unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None],
+) -> list[str | None] | None:
+    replacement_symbols = _unbacked_symbols(expr)
+    if not replacement_symbols:
+        return [None]
+
+    origins: list[str | None] = []
+    for replacement_symbol in replacement_symbols:
+        if replacement_symbol not in unbacked_symbol_to_origin_node:
+            return None
+        origins.append(unbacked_symbol_to_origin_node[replacement_symbol])
+    return origins
+
+
+def _solve_runtime_assert_for_symbol(
+    symbol: sympy.Symbol, expr: sympy.Expr
+) -> sympy.Expr | None:
+    if not isinstance(expr, sympy.Equality):
+        return None
+    if expr.lhs == symbol:
+        return expr.rhs
+    if expr.rhs == symbol:
+        return expr.lhs
+    solved = try_solve(expr, symbol)
+    if solved is None:
+        return None
+    return solved[1]
+
+
+def _resolve_unbacked_symbol_origins(
+    symbol: sympy.Symbol,
+    unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None],
+    shape_env: Any,
+) -> list[str | None] | None:
+    if symbol in unbacked_symbol_to_origin_node:
+        return [unbacked_symbol_to_origin_node[symbol]]
+
+    if shape_env is None:
+        return None
+
+    replacement = shape_env.replace(symbol)
+    if replacement == symbol:
+        deferred_runtime_asserts = getattr(shape_env, "deferred_runtime_asserts", {})
+        for runtime_assert in deferred_runtime_asserts.get(symbol, ()):
+            replacement = _solve_runtime_assert_for_symbol(symbol, runtime_assert.expr)
+            if replacement is not None:
+                break
+        else:
+            return None
+
+    origins = _origins_for_unbacked_expr(replacement, unbacked_symbol_to_origin_node)
+    if origins is None:
+        return None
+
+    if len(origins) == 1:
+        unbacked_symbol_to_origin_node[symbol] = origins[0]
+
+    return origins
 
 
 @dataclasses.dataclass
@@ -4518,6 +4592,7 @@ class Scheduler:
 
         # pyrefly: ignore [not-a-type, unsupported-operation]
         unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None] = {}
+        shape_env = getattr(V.graph.sizevars, "shape_env", None)
 
         # NB: None means that the dependency is on an input.  Don't actually
         # generate a dependency because if we do, Inductor will start trying
@@ -4563,12 +4638,16 @@ class Scheduler:
                 )
                 # if a kernel takes unbacked symints, register dependencies
                 for s in unbacked_symbol_uses:
-                    assert s in unbacked_symbol_to_origin_node, (
+                    origins = _resolve_unbacked_symbol_origins(
+                        s, unbacked_symbol_to_origin_node, shape_env
+                    )
+                    assert origins is not None, (
                         f"{s} not in {unbacked_symbol_to_origin_node}"
                     )
-                    if (r := unbacked_symbol_to_origin_node[s]) is not None:
-                        for buf in self.name_to_node[r].get_outputs():
-                            node.add_fake_dep(StarDep(buf.get_name()))
+                    for r in origins:
+                        if r is not None:
+                            for buf in self.name_to_node[r].get_outputs():
+                                node.add_fake_dep(StarDep(buf.get_name()))
 
             if (
                 len(node.read_writes.writes) == 1
@@ -4648,17 +4727,21 @@ class Scheduler:
         if has_non_input_unbacked_defs:
             for out in V.graph.graph_outputs:
                 for s in out.get_free_symbol_uses(unbacked_only=True):
-                    assert s in unbacked_symbol_to_origin_node, (
+                    origins = _resolve_unbacked_symbol_origins(
+                        s, unbacked_symbol_to_origin_node, shape_env
+                    )
+                    assert origins is not None, (
                         f"{s} not in {unbacked_symbol_to_origin_node.keys()}"
                     )
-                    if r := unbacked_symbol_to_origin_node[s]:
-                        for buf_name in self.name_to_node[r].get_buffer_names():
-                            log.debug(
-                                "scheduling output %s for unbacked symint %s",
-                                buf_name,
-                                s,
-                            )
-                            add_user(buf_name, OutputNode(StarDep(buf_name)))
+                    for r in origins:
+                        if r:
+                            for buf_name in self.name_to_node[r].get_buffer_names():
+                                log.debug(
+                                    "scheduling output %s for unbacked symint %s",
+                                    buf_name,
+                                    s,
+                                )
+                                add_user(buf_name, OutputNode(StarDep(buf_name)))
 
         # make sure input mutation isn't dead-code-eliminated
         for name in self.mutation_renames:

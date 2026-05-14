@@ -11,6 +11,7 @@ from torch._dynamo.testing import AotEagerAndRecordGraphs
 from torch._dynamo.utils import detect_fake_mode
 from torch._inductor.compile_fx import _get_subgraph_names
 from torch._inductor.fx_utils import (
+    _extract_subgraphs_and_args,
     _is_fake_tensor_same,
     count_flops_fx,
     countable_fx,
@@ -659,6 +660,72 @@ class TestFakeTensorUpdater(TestCase):
         self.assertIs(
             mask_placeholders[-1].meta["val"], restrided_mask_buffer_node.meta["val"]
         )
+
+    def test_flex_attention_subgraph_args_ignore_dead_captures(self):
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            score = torch.empty((), dtype=torch.float32)
+            scalar = torch.empty((), dtype=torch.int32)
+            query = torch.empty(1, 1, 128, 64)
+            doc_ids = torch.empty(1, 128, dtype=torch.int64)
+
+        score_graph = torch.fx.Graph()
+        score_placeholders = [
+            score_graph.placeholder(name)
+            for name in ("score", "b", "h", "q_idx", "kv_idx")
+        ]
+        for placeholder, meta in zip(
+            score_placeholders,
+            (score, scalar, scalar, scalar, scalar),
+            strict=True,
+        ):
+            placeholder.meta["val"] = meta
+        score_graph.output(score_placeholders[0])
+        score_gm = torch.fx.GraphModule(torch.nn.Module(), score_graph)
+
+        mask_graph = torch.fx.Graph()
+        mask_placeholders = [
+            mask_graph.placeholder(name) for name in ("b", "h", "q_idx", "kv_idx")
+        ]
+        for placeholder in mask_placeholders:
+            placeholder.meta["val"] = scalar
+        dead_len = mask_graph.placeholder("dead_len")
+        live_doc_ids = mask_graph.placeholder("doc_ids")
+        live_doc_ids.meta["val"] = doc_ids
+        mask_graph.output(live_doc_ids)
+        mask_gm = torch.fx.GraphModule(torch.nn.Module(), mask_graph)
+
+        graph = torch.fx.Graph()
+        flex_node = graph.call_function(torch.ops.higher_order.flex_attention)
+
+        extracted = list(
+            _extract_subgraphs_and_args(
+                flex_node,
+                {score_gm, mask_gm},
+                query,
+                query,
+                query,
+                score_gm,
+                (128, 128, mask_gm),
+                1.0,
+                {},
+                (),
+                (128, doc_ids),
+            )
+        )
+
+        self.assertIs(extracted[0][0], score_gm)
+        self.assertEqual(len(extracted[0][1]), 5)
+        self.assertIs(extracted[0][1][0], score)
+        for arg in extracted[0][1][1:]:
+            self.assertIs(arg, scalar)
+        self.assertEqual(extracted[1][0], mask_gm)
+        for arg in extracted[1][1][:4]:
+            self.assertIs(arg, scalar)
+        self.assertIsNone(extracted[1][1][4])
+        self.assertIs(extracted[1][1][5], doc_ids)
+        self.assertFalse(dead_len.users)
+        self.assertTrue(live_doc_ids.users)
 
     def test_reorder_nodes(self):
         def fn(*args: torch.Tensor) -> torch.Tensor:

@@ -1497,6 +1497,25 @@ def _register_unbacked_slice_size_bindings(dim, start, end, step, size):
     return sym_size, sym_storage
 
 
+def _drop_current_node_storage_offset_binding():
+    from torch.fx.experimental.symbolic_shapes import CallMethodKey
+
+    current_node = V.graph.current_node
+    if current_node is None:
+        return
+
+    node_unbacked_bindings = current_node.meta.get("unbacked_bindings")
+    if not node_unbacked_bindings:
+        return
+
+    storage_offset_keypath = (CallMethodKey("storage_offset"),)
+    current_node.meta["unbacked_bindings"] = {
+        sym: keypath
+        for sym, keypath in node_unbacked_bindings.items()
+        if keypath != storage_offset_keypath
+    }
+
+
 @register_lowering(aten.slice, type_promotion_kind=None)
 def slice_(x, dim=0, start=0, end=sys.maxsize, step=1, clamp=True):
     """
@@ -1591,11 +1610,13 @@ def slice_(x, dim=0, start=0, end=sys.maxsize, step=1, clamp=True):
     sym_size, sym_storage = _register_unbacked_slice_size_bindings(
         dim, start, end, step, x.get_size()[dim]
     )
-    assert sym_size is not None
-
     if x.maybe_get_layout() is None:
-        # realize tensor before accessing layout
-        x.realize()
+        if sym_storage is not None:
+            _drop_current_node_storage_offset_binding()
+        return TensorBox(
+            ir.SliceView.create(x.data, dim, start, end, step, clamp=clamp)
+        )
+    assert sym_size is not None
 
     if start_index is not None:
         # we shouldn't have allocated storage offset symbol if start index was determinable
@@ -4082,11 +4103,31 @@ def _local_scalar_dense(data):
     # solely responsible for generating this .item().  The buffer is
     # not used for anything (notice we discard it); at codegen time,
     # the "buffer" just gets assigned None.
+    current_node = V.graph.current_node
+    assert current_node is not None
+    val = current_node.meta["val"]
     unbacked_bindings = resolve_unbacked_bindings(
-        V.graph.sizevars.shape_env, V.graph.current_node.meta["unbacked_bindings"]
+        V.graph.sizevars.shape_env, current_node.meta.get("unbacked_bindings", {})
     )
     assert unbacked_bindings is not None
-    assert len(unbacked_bindings) == 1, unbacked_bindings
+    if unbacked_bindings:
+        assert len(unbacked_bindings) == 1, unbacked_bindings
+        binding_sym, keypath = next(iter(unbacked_bindings.items()))
+    else:
+        expr = val.node.expr if isinstance(val, torch.SymInt) else None
+        if isinstance(
+            expr, sympy.Symbol
+        ) and V.graph.sizevars.shape_env.is_unbacked_symint(expr):
+            binding_sym = expr
+        elif isinstance(val, torch.SymFloat):
+            binding_sym = (
+                V.graph.sizevars.shape_env.create_unbacked_symfloat().node.expr
+            )
+        elif isinstance(val, torch.SymBool):
+            binding_sym = V.graph.sizevars.shape_env.create_unbacked_symbool().node.expr
+        else:
+            binding_sym = V.graph.sizevars.shape_env.create_unbacked_symint().node.expr
+        keypath = ()
     # NB: Have to be very careful here.  V.graph.current_node.meta["val"]
     # seemingly also contains a symbol which you want to do binding for,
     # but it actually isn't.  In particular, if we have later performed
@@ -4102,15 +4143,15 @@ def _local_scalar_dense(data):
     # in order to appropriately bind u0.  This is communicated via the keypath
     # in unbacked_bindings, and we need to hold onto it in order to generate
     # code appropriately for this case.
-    binding_sym, keypath = next(iter(unbacked_bindings.items()))
     buffer = ir.DynamicScalar(binding_sym, keypath, data)
     buffer.name = V.graph.register_buffer(buffer)
     V.graph.register_operation(buffer)
     # NB: the replaced expr is OK to use directly downstream, we want
     # simplifications in this case!
-    val = V.graph.current_node.meta["val"]
     if isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)):
         return val.node.expr
+    elif not unbacked_bindings:
+        return binding_sym
     else:
         return sympy.sympify(val)
 

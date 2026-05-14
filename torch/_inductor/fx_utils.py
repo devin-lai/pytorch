@@ -244,6 +244,21 @@ def _extract_subgraphs_and_args(
             get_fake(n, subgraph) for n in subgraph.graph.find_nodes(op="placeholder")
         )
 
+    def get_live_capture_args(
+        subgraph: torch.fx.GraphModule,
+        num_fixed_args: int,
+        capture_args: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        placeholders = subgraph.graph.find_nodes(op="placeholder")
+        captures = placeholders[num_fixed_args:]
+        assert len(captures) == len(capture_args), (
+            "flex_attention subgraph captures do not match HOP args"
+        )
+        return tuple(
+            arg if placeholder.users else get_fake(placeholder, subgraph)
+            for placeholder, arg in zip(captures, capture_args, strict=True)
+        )
+
     def is_integer(d: torch.dtype) -> bool:
         return not d.is_floating_point and not d.is_complex
 
@@ -284,8 +299,20 @@ def _extract_subgraphs_and_args(
             )
         ), "flex_attention subgraph arg format has changed!"
 
-        yield score_subgraph, (*score_subgraph_args[:5], *args[7])
-        yield args[4][-1], (*mask_subgraph_args[:4], *args[8])
+        yield (
+            score_subgraph,
+            (
+                *score_subgraph_args[:5],
+                *get_live_capture_args(score_subgraph, 5, args[7]),
+            ),
+        )
+        yield (
+            mask_subgraph,
+            (
+                *mask_subgraph_args[:4],
+                *get_live_capture_args(mask_subgraph, 4, args[8]),
+            ),
+        )
     elif node.target is torch.ops.higher_order.flex_attention_backward:
         fw_subgraph = args[7]
         fw_subgraph_args = get_subgraph_args(fw_subgraph)
@@ -318,11 +345,29 @@ def _extract_subgraphs_and_args(
         ), "flex_attention_backward subgraph arg format has changed!"
 
         if fw_subgraph in valid_subgraphs:
-            yield fw_subgraph, (*fw_subgraph_args[:5], *args[12])
+            yield (
+                fw_subgraph,
+                (
+                    *fw_subgraph_args[:5],
+                    *get_live_capture_args(fw_subgraph, 5, args[12]),
+                ),
+            )
         if joint_subgraph in valid_subgraphs:
-            yield joint_subgraph, (*joint_subgraph_args[:6], *args[12])
+            yield (
+                joint_subgraph,
+                (
+                    *joint_subgraph_args[:6],
+                    *get_live_capture_args(joint_subgraph, 6, args[12]),
+                ),
+            )
         if mask_subgraph in valid_subgraphs:
-            yield mask_subgraph, (*mask_subgraph_args[:4], *args[13])
+            yield (
+                mask_subgraph,
+                (
+                    *mask_subgraph_args[:4],
+                    *get_live_capture_args(mask_subgraph, 4, args[13]),
+                ),
+            )
     elif node.target in (
         torch.ops.higher_order.foreach_map,
         torch.ops.higher_order.invoke_quant_packed,

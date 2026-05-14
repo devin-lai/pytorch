@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 import functools
 import unittest
+from collections import OrderedDict
 from unittest import mock
 
 import sympy
@@ -9,6 +10,8 @@ import torch
 from torch._dynamo import config as dynamo_config
 from torch._dynamo.exc import InternalTorchDynamoError
 from torch._inductor import config as inductor_config, ir
+from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+from torch._inductor.scheduler import _resolve_unbacked_symbol_origins
 from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.virtualized import V
@@ -22,9 +25,95 @@ from torch.testing._internal.common_device_type import (
 )
 from torch.testing._internal.common_utils import parametrize, skipIfXpu
 from torch.testing._internal.inductor_utils import HAS_GPU
+from torch.utils._ordered_set import OrderedSet
 
 
 class TestUnbackedSymints(InductorTestCase):
+    def test_python_wrapper_binds_tensor_input_size_and_stride_expr(self, device):
+        graph = mock.Mock()
+        graph.cpp_wrapper = False
+        graph.aot_mode = False
+        graph.constant_reprs = {}
+        graph.graph_inputs = OrderedDict()
+        graph.graph_input_names = []
+        graph.graph_outputs = []
+        graph.removed_buffers = set()
+        graph.inplaced_to_remove = set()
+        graph.get_training_phase.return_value = ""
+
+        with V.set_graph_handler(graph):
+            wrapper = PythonWrapperCodegen()
+            u0 = sympy.Symbol("u0", integer=True)
+            input_size_expr = u0 // 2
+            input_stride_expr = 4 * sympy.Max(1, u0 // 2)
+            tensor = ir.TensorBox.create(
+                ir.Buffer(
+                    name="arg0_1",
+                    layout=ir.FixedLayout(
+                        torch.device(device),
+                        torch.float32,
+                        size=[input_size_expr, 4],
+                        stride=[input_stride_expr, 1],
+                    ),
+                )
+            )
+
+            bound_vars: OrderedSet[sympy.Symbol] = OrderedSet()
+            wrapper.codegen_input_symbol_assignment("arg0_1", tensor, bound_vars)
+
+            replacement = wrapper.input_expr_replacements[input_size_expr]
+            self.assertEqual(str(replacement), "arg0_1_size_0")
+            self.assertIn(replacement, bound_vars)
+            self.assertExpectedInline(
+                wrapper.codegen_python_sizevar(input_size_expr, simplify=False),
+                """arg0_1_size_0""",
+            )
+            stride_replacement = wrapper.input_expr_replacements[input_stride_expr]
+            self.assertEqual(str(stride_replacement), "arg0_1_stride_0")
+            self.assertIn(stride_replacement, bound_vars)
+            self.assertExpectedInline(
+                wrapper.codegen_python_sizevar(input_stride_expr, simplify=False),
+                """arg0_1_stride_0""",
+            )
+
+        prefix = wrapper.prefix.getvalue()
+        self.assertIn("arg0_1_size = arg0_1.size()", prefix)
+        self.assertIn("arg0_1_size_0 = arg0_1_size[0]", prefix)
+        self.assertIn("arg0_1_stride = arg0_1.stride()", prefix)
+        self.assertIn("arg0_1_stride_0 = arg0_1_stride[0]", prefix)
+
+    def test_scheduler_resolves_unbacked_alias_origin(self, device):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        origin = shape_env.create_unbacked_symint().node.expr
+        alias = shape_env.create_unbacked_symint().node.expr
+        shape_env._rename_unbacked_to(alias, origin)
+
+        origin_map: dict[sympy.Symbol, str | None] = {origin: "op0"}
+
+        self.assertEqual(
+            _resolve_unbacked_symbol_origins(alias, origin_map, shape_env),
+            ["op0"],
+        )
+        self.assertEqual(origin_map[alias], "op0")
+
+    def test_scheduler_resolves_runtime_asserted_unbacked_origin(self, device):
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv(prefer_deferred_runtime_asserts_over_guards=True)
+        origin = shape_env.create_unbacked_symint().node.expr
+        alias = shape_env.create_unbacked_symint().node.expr
+        shape_env.guard_or_defer_runtime_assert(sympy.Eq(alias, origin), "")
+
+        origin_map: dict[sympy.Symbol, str | None] = {origin: "op0"}
+
+        self.assertEqual(
+            _resolve_unbacked_symbol_origins(alias, origin_map, shape_env),
+            ["op0"],
+        )
+        self.assertEqual(origin_map[alias], "op0")
+
     @skipGPUIf(not HAS_GPU, "requires gpu and triton")
     @dynamo_config.patch({"capture_dynamic_output_shape_ops": True})
     def test_expand(self, device):
@@ -125,6 +214,48 @@ class TestUnbackedSymints(InductorTestCase):
             )  # make sure no unbacked symint in output's stride
 
         example_inputs = (torch.randn(1, 1, 1, 1, device=device),)
+        actual = torch.compile(fn, fullgraph=True)(*example_inputs)
+        expected = fn(*example_inputs)
+        torch.testing.assert_close(actual, expected)
+
+    @skipGPUIf(not HAS_GPU, "requires gpu and triton")
+    @dynamo_config.patch({"capture_scalar_outputs": True})
+    def test_symbolic_slice_of_slice_view(self, device):
+        def fn(n_src):
+            n = n_src.item()
+            torch._check(n >= 1)
+            torch._check(n <= 8)
+
+            base = torch.arange(8 * n, device=device)
+            window = torch.ops.aten.slice.Tensor(base, 0, n, 2 * n)
+            window_size = -torch.sym_min(n, 8 * n) + torch.sym_min(2 * n, 8 * n)
+            start = torch.sym_min(0, window_size)
+            end = torch.sym_min(window_size, (window_size + 1) // 2)
+            return torch.ops.aten.slice.Tensor(window, 0, start, end)
+
+        example_inputs = (torch.tensor([2], device=device),)
+        actual = torch.compile(fn, fullgraph=True)(*example_inputs)
+        expected = fn(*example_inputs)
+        torch.testing.assert_close(actual, expected)
+
+    @skipGPUIf(not HAS_GPU, "requires gpu and triton")
+    @dynamo_config.patch({"capture_scalar_outputs": True})
+    def test_nested_symbolic_slice_of_slice_view(self, device):
+        def fn(n_src):
+            n = n_src.item()
+            torch._check(n >= 1)
+            torch._check(n <= 8)
+
+            base = torch.arange(8 * n, device=device)
+            first_start = torch.sym_min(0, 8 * n)
+            first_end = torch.sym_min(n, 8 * n)
+            window = torch.ops.aten.slice.Tensor(base, 0, first_start, first_end)
+            window_size = -torch.sym_min(0, 8 * n) + torch.sym_min(n, 8 * n)
+            start = torch.sym_min(0, window_size)
+            end = torch.sym_min(window_size, (window_size + 1) // 2)
+            return torch.ops.aten.slice.Tensor(window, 0, start, end)
+
+        example_inputs = (torch.tensor([2], device=device),)
         actual = torch.compile(fn, fullgraph=True)(*example_inputs)
         expected = fn(*example_inputs)
         torch.testing.assert_close(actual, expected)

@@ -1467,7 +1467,11 @@ def flex_attention_backward_fake_tensor_mode(
     broadcasted_grad_value = value.new_empty((Bq, Hkv, seq_len_kv, v_head_dim))
     broadcasted_grad_value = _permute_strides(broadcasted_grad_value, value.stride())
 
-    if Bq > 1 and Bkv == 1:
+    from torch.fx.experimental.symbolic_shapes import guard_or_false
+
+    # Reducing a batch-1 key/value gradient is harmless when Bq is also 1, and
+    # avoids guarding on symbolic Bq expressions such as chunked ``u0 // 2``.
+    if guard_or_false(Bkv == 1):
         grad_key = torch.sum(broadcasted_grad_key, dim=0, keepdim=True)
         grad_value = torch.sum(broadcasted_grad_value, dim=0, keepdim=True)
     else:

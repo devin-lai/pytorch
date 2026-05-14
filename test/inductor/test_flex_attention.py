@@ -24,6 +24,10 @@ import torch.nn as nn
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._inductor import config, metrics
 from torch._inductor.exc import InductorError
+from torch._inductor.kernel.flex.flex_attention import (
+    _prune_unused_score_mod_buffers,
+    _prune_unused_subgraph_buffers,
+)
 from torch._inductor.runtime.triton_compat import HAS_WARP_SPEC
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
@@ -3923,6 +3927,85 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
+    def test_backward_unbacked_batch(self, device):
+        x = torch.randn(
+            (4, 2, 128, 64),
+            device=device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        x_ref = x.detach().clone().requires_grad_(True)
+        torch._dynamo.decorators.mark_unbacked(x, 0, hint_override=x.shape[0])
+
+        def fn(x):
+            mid = x.shape[0] // 2
+            chunk0 = x[:mid]
+            chunk1 = x[mid:]
+            return (
+                flex_attention(chunk0, chunk0, chunk0).sum()
+                + flex_attention(chunk1, chunk1, chunk1).sum()
+            )
+
+        actual = torch.compile(fn, dynamic=True, fullgraph=True)(x)
+        expected = fn(x_ref)
+        self.assertEqual(actual, expected, atol=1e-2, rtol=1e-3)
+
+        actual.backward()
+        expected.backward()
+        self.assertEqual(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+
+    @supported_platform
+    @skip_on_cpu
+    @common_utils.parametrize("mark_batch_unbacked", [False, True])
+    def test_live_score_mod_size_capture_preserved(self, device, mark_batch_unbacked):
+        x = torch.randn(
+            (2, 2, 128, 64),
+            device=device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        x_ref = x.detach().clone().requires_grad_(True)
+        if mark_batch_unbacked:
+            torch._dynamo.decorators.mark_unbacked(x, 0, hint_override=x.shape[0])
+
+        def fn(x):
+            batch_size = x.size(0)
+
+            def score_mod(score, _b, _h, q, kv):
+                return score + (q - kv) * batch_size * 0.01
+
+            return flex_attention(x, x, x, score_mod).sum()
+
+        actual = torch.compile(fn, dynamic=True, fullgraph=True)(x)
+        expected = fn(x_ref)
+        self.assertEqual(actual, expected, atol=1e-2, rtol=1e-3)
+
+        actual.backward()
+        expected.backward()
+        self.assertEqual(x.grad, x_ref.grad, atol=1e-2, rtol=1e-3)
+
+    @supported_platform
+    @skip_on_cpu
+    def test_block_mask_unbacked_sequence(self, device):
+        x = torch.randn(
+            (1, 2, 128, 64),
+            device=device,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        torch._dynamo.decorators.mark_unbacked(
+            x, 2, hint_override=x.shape[2], min=2, max=x.shape[2]
+        )
+        block_mask = create_block_mask(noop_mask, None, None, 128, 128, device=device)
+
+        @torch.compile(dynamic=True, fullgraph=True)
+        def fn(x):
+            return flex_attention(x, x, x, block_mask=block_mask).sum()
+
+        fn(x).backward()
+
+    @supported_platform
+    @skip_on_cpu
     @expected_not_implemented_on_mps  # backward path; NIE on MPS via _validate_device
     def test_differentiable_logsumexp_gradcheck(self, device):
         # See test_aot_eager_gradcheck for the per-device dtype rationale.
@@ -6413,6 +6496,89 @@ class GraphModule(torch.nn.Module):
         self.assertTrue(
             flexible_layout_called,
             "get_stride_and_maybe_freeze_layout should be called with FlexibleLayout nodes",
+        )
+
+
+class TestFlexAttentionLowering(InductorTestCase):
+    def test_prune_unused_subgraph_buffers(self):
+        def mask_graph(
+            b,
+            _h,
+            q_idx,
+            _kv_idx,
+            unused_capture,
+            used_tensor,
+            used_backed_size,
+            used_unbacked_size,
+        ):
+            return q_idx < (used_tensor + used_backed_size + used_unbacked_size + b)
+
+        graph_module = torch.fx.symbolic_trace(mask_graph)
+        unused_buffer = object()
+        used_tensor_buffer = object()
+        used_backed_size_buffer = 7
+        used_unbacked_size_buffer = object()
+
+        kept_buffers = _prune_unused_subgraph_buffers(
+            graph_module,
+            num_fixed_placeholders=4,
+            other_buffers=[
+                unused_buffer,
+                used_tensor_buffer,
+                used_backed_size_buffer,
+                used_unbacked_size_buffer,
+            ],
+        )
+
+        self.assertEqual(
+            kept_buffers,
+            [
+                used_tensor_buffer,
+                used_backed_size_buffer,
+                used_unbacked_size_buffer,
+            ],
+        )
+        self.assertNotIn(
+            "unused_capture",
+            [node.name for node in graph_module.graph.nodes],
+        )
+        node_names = [node.name for node in graph_module.graph.nodes]
+        self.assertIn("used_tensor", node_names)
+        self.assertIn("used_backed_size", node_names)
+        self.assertIn("used_unbacked_size", node_names)
+
+    def test_prune_unused_score_mod_buffers_across_fw_and_joint_graphs(self):
+        def fw_graph(score, _b, _h, _m, _n, unused, fw_used, joint_used):
+            return score + fw_used
+
+        def joint_graph(score, _b, _h, _m, _n, grad, unused, fw_used, joint_used):
+            return score + grad + joint_used
+
+        fw_graph_module = torch.fx.symbolic_trace(fw_graph)
+        joint_graph_module = torch.fx.symbolic_trace(joint_graph)
+        unused_buffer = object()
+        fw_used_buffer = 3
+        joint_used_buffer = object()
+
+        kept_buffers = _prune_unused_score_mod_buffers(
+            fw_graph_module,
+            joint_graph_module,
+            [unused_buffer, fw_used_buffer, joint_used_buffer],
+        )
+
+        self.assertEqual(kept_buffers, [fw_used_buffer, joint_used_buffer])
+        for graph_module in (fw_graph_module, joint_graph_module):
+            self.assertNotIn(
+                "unused",
+                [node.name for node in graph_module.graph.nodes],
+            )
+        self.assertIn(
+            "fw_used",
+            [node.name for node in fw_graph_module.graph.nodes],
+        )
+        self.assertIn(
+            "joint_used",
+            [node.name for node in joint_graph_module.graph.nodes],
         )
 
 

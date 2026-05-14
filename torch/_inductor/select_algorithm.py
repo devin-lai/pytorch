@@ -1051,6 +1051,7 @@ class TritonTemplateKernel(TritonKernel):
         else:
             assert isinstance(name, str)
             val = self.named_input_nodes[name].get_size()[index]
+        val = V.graph.sizevars.lookup_precomputed_size(val)
         result = texpr(self.rename_indexing(val))
         if self.index_dtype == "tl.int64":
             return f"tl.full([], {result}, dtype=INDEX_DTYPE)"
@@ -1068,8 +1069,17 @@ class TritonTemplateKernel(TritonKernel):
             val = self.get_stride_and_maybe_freeze_layout(self.named_input_nodes[name])
 
         if isinstance(index, int):
-            return texpr(self.rename_indexing(val[index]))
-        return ", ".join([texpr(self.rename_indexing(i)) for i in val])
+            return texpr(
+                self.rename_indexing(
+                    V.graph.sizevars.lookup_precomputed_size(val[index])
+                )
+            )
+        return ", ".join(
+            [
+                texpr(self.rename_indexing(V.graph.sizevars.lookup_precomputed_size(i)))
+                for i in val
+            ]
+        )
 
     def _get_subgraph(self, subgraph_number: int):
         assert isinstance(subgraph_number, int)
