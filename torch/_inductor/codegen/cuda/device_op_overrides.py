@@ -139,11 +139,11 @@ class CUDADeviceOpOverrides(DeviceOpOverrides):
                     void* args[],
                     cudaStream_t stream) {
                 CUDA_DRIVER_CHECK(cuLaunchKernel(
-                    func, gridX, gridY, gridZ, {warp_size}*numWarps, 1, 1, sharedMemBytes, stream, args, nullptr
+                    func, gridX, gridY, gridZ, __WARP_SIZE__*numWarps, 1, 1, sharedMemBytes, stream, args, nullptr
                 ));
             }
-        """.format(warp_size=warp_size)
-        return source_codes
+        """
+        return source_codes.replace("__WARP_SIZE__", str(warp_size))
 
     def tma_descriptor_helpers(self) -> str:
         """
