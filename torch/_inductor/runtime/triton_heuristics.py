@@ -3286,19 +3286,18 @@ def _num_warps(num_warps, max_num_warps=8, min_num_warps=2, register_intensive=F
     return next_power_of_2(min(max(num_warps, min_num_warps), max_num_warps))
 
 
-def _get_current_warp_size() -> int:
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_properties(torch.cuda.current_device()).warp_size
+# Callers pass DeviceProperties.warp_size when the device backend reports it.
+# Some tests or extension backends may not expose warp_size, so keep the old
+# CUDA/HIP fallback without querying CUDA state from forked compile workers.
+def _warp_size_or_default(warp_size: int | None) -> int:
+    return warp_size if warp_size is not None else (64 if torch.version.hip else 32)
 
-    # Fallback only for tests/import paths where no device is available.
-    return 64 if torch.version.hip else 32
 
-
-def _check_max_grid_x(size_hints, x, num_warps):
+def _check_max_grid_x(size_hints, x, num_warps, warp_size=None):
     # Check if maxGridSize is exceeded - if so then must scale XBLOCK further
     max_grid_x = 2147483647
     max_block_x = TRITON_MAX_BLOCK["X"]
-    warp_size = _get_current_warp_size()
+    warp_size = _warp_size_or_default(warp_size)
     num_blocks = (size_hints["x"] + x - 1) // x
 
     if torch.version.hip:
@@ -3335,6 +3334,7 @@ def triton_config(
     matrix_instr=None,
     waves_per_eu=None,
     kpack=None,
+    warp_size=None,
 ) -> Config:
     """
     Construct a pointwise triton config with some adjustment heuristics
@@ -3411,11 +3411,11 @@ def triton_config(
     # Increase x to satisfy min_elem_per_thread requirements.
     block_size = max(
         conditional_product(x, y, z),
-        min_elem_per_thread * _get_current_warp_size() * num_warps,
+        min_elem_per_thread * _warp_size_or_default(warp_size) * num_warps,
     )
     x *= math.ceil(block_size / conditional_product(x, y, z))
 
-    x, _num_blocks = _check_max_grid_x(size_hints, x, num_warps)
+    x, _num_blocks = _check_max_grid_x(size_hints, x, num_warps, warp_size)
     x = min(x, size_hints["x"])
 
     cfg = {"XBLOCK": x}
@@ -3487,6 +3487,7 @@ def triton_config_reduction(
     dynamic_scale_rblock=True,
     reduction_hint=None,
     min_num_warps=None,
+    warp_size=None,
 ) -> Config:
     """
     Construct a reduction triton config with some adjustment heuristics
@@ -3530,7 +3531,7 @@ def triton_config_reduction(
         num_warps, max_num_warps=max_num_warps, register_intensive=register_intensive
     )
 
-    x, _num_blocks = _check_max_grid_x(size_hints, x, num_warps)
+    x, _num_blocks = _check_max_grid_x(size_hints, x, num_warps, warp_size)
 
     for prefix in sorted(rnumels):
         while total_numel() > target:
@@ -3914,7 +3915,9 @@ def pointwise(
     )
 
     triton_config_with_settings = functools.partial(
-        triton_config, min_elem_per_thread=min_elem_per_thread
+        triton_config,
+        min_elem_per_thread=min_elem_per_thread,
+        warp_size=triton_meta["device"].warp_size,
     )
 
     configs = None
@@ -4132,6 +4135,7 @@ def _reduction_configs(
     num_dynamic=0,
 ) -> list[Config]:
     reduction_hint = inductor_meta.get("reduction_hint")
+    warp_size = triton_meta["device"].warp_size
 
     # Convert reductions to 1D, to simplify heuristics.
     rnumel = get_total_reduction_numel(size_hints)
@@ -4213,6 +4217,7 @@ def _reduction_configs(
                 waves_per_eu=waves_per_eu,
                 dynamic_scale_rblock=dynamic_scale_rblock,
                 reduction_hint=reduction_hint,
+                warp_size=warp_size,
             )
 
     def outer_config_opt():
@@ -4699,6 +4704,7 @@ def _persistent_reduction_configs(
     max_autotune_enabled = inductor_meta.get("max_autotune") or inductor_meta.get(
         "max_autotune_pointwise"
     )
+    warp_size = triton_meta["device"].warp_size
 
     if torch.version.hip:
         xblock_vals = [1, 4, 8, 16, 32, 64, 128, 256]
@@ -4713,6 +4719,7 @@ def _persistent_reduction_configs(
                 rnumel,
                 register_intensive=True,
                 reduction_hint=reduction_hint,
+                warp_size=warp_size,
             )
             for xblock in xblock_vals
             if xblock == 1
@@ -4743,6 +4750,7 @@ def _persistent_reduction_configs(
             size_hints,
             2 * (256 // rnumel) if rnumel <= 256 else 1,
             rnumel,
+            warp_size=warp_size,
         )
     ]
 
@@ -4778,6 +4786,7 @@ def _persistent_reduction_configs(
                         num_warps=num_warps,
                         min_num_warps=min_num_warps,
                         reduction_hint=reduction_hint,
+                        warp_size=warp_size,
                     )
                 ]
 
