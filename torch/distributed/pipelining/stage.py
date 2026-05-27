@@ -630,7 +630,22 @@ class _PipelineStageBase(ABC):
                         run_check=False,
                     ).requires_grad_(effective_requires_grad)
                 else:
-                    activation = info.buffer.requires_grad_(effective_requires_grad)
+                    # Detach the recv buffer so the stage receives a fresh tensor
+                    # identity each step.  Without this, requires_grad_() is
+                    # in-place and returns self, directly aliasing the persistent
+                    # recv buffer as the stage activation; backward hooks attached
+                    # by user code (e.g. via module forward hooks for debugging or
+                    # gradient collection) then accumulate on the buffer across
+                    # steps instead of being discarded when the activation goes
+                    # out of scope.  detach() creates a new tensor object that
+                    # shares the buffer's storage (zero-copy), preserving pinned
+                    # memory or custom allocator properties (e.g. nvshmem) while
+                    # giving the activation an independent Python identity so
+                    # hooks do not leak between steps.  The detached tensor is a
+                    # leaf after requires_grad_(), so the is_leaf check below and
+                    # gradient accumulation both work correctly.
+                    # See https://github.com/pytorch/pytorch/issues/185331
+                    activation = info.buffer.detach().requires_grad_(effective_requires_grad)
                 # Activation must be a leaf so backward terminates here.
                 if effective_requires_grad and not activation.is_leaf:
                     warnings.warn(
