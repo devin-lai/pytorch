@@ -3289,7 +3289,7 @@ def _num_warps(num_warps, max_num_warps=8, min_num_warps=2, register_intensive=F
 # Callers pass DeviceProperties.warp_size when the device backend reports it.
 # Some tests or extension backends may not expose warp_size, so keep the old
 # CUDA/HIP fallback without querying CUDA state from forked compile workers.
-def _warp_size_or_default(warp_size: int | None) -> int:
+def _device_warp_size_or_default(warp_size: int | None) -> int:
     return warp_size if warp_size is not None else (64 if torch.version.hip else 32)
 
 
@@ -3297,7 +3297,7 @@ def _check_max_grid_x(size_hints, x, num_warps, warp_size=None):
     # Check if maxGridSize is exceeded - if so then must scale XBLOCK further
     max_grid_x = 2147483647
     max_block_x = TRITON_MAX_BLOCK["X"]
-    warp_size = _warp_size_or_default(warp_size)
+    warp_size = _device_warp_size_or_default(warp_size)
     num_blocks = (size_hints["x"] + x - 1) // x
 
     if torch.version.hip:
@@ -3411,7 +3411,7 @@ def triton_config(
     # Increase x to satisfy min_elem_per_thread requirements.
     block_size = max(
         conditional_product(x, y, z),
-        min_elem_per_thread * _warp_size_or_default(warp_size) * num_warps,
+        min_elem_per_thread * _device_warp_size_or_default(warp_size) * num_warps,
     )
     x *= math.ceil(block_size / conditional_product(x, y, z))
 
