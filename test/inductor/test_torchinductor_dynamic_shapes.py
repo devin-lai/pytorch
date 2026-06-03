@@ -702,6 +702,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         On CUDA: uses num_blocks only (not num_blocks * num_warps * warp_size).
         On ROCm: uses num_blocks * num_warps * warp_size (total threads limit).
         """
+        from torch._inductor.runtime.hints import DeviceProperties
         from torch._inductor.runtime.triton_heuristics import (
             _check_max_grid_x,
             _num_warps,
@@ -710,12 +711,21 @@ class TestInductorDynamic(DynamicShapesTestCase):
         size_hints = {"x": 600_000_000}
         x = 64
         num_warps = _num_warps(8)
+        warp_size = 64 if torch.version.hip else 32
+        device_props = DeviceProperties(
+            type="hip" if torch.version.hip else "cuda",
+            index=0,
+            multi_processor_count=1,
+            cc="gfx000" if torch.version.hip else 80,
+            warp_size=warp_size,
+        )
 
-        result_x, result_num_blocks = _check_max_grid_x(size_hints, x, num_warps)
+        result_x, result_num_blocks = _check_max_grid_x(
+            size_hints, x, num_warps, device_props
+        )
 
         max_grid_x = 2147483647
         if torch.version.hip:
-            warp_size = 64  # TODO: query warp size once #129663 is merged
             # ROCm limits total threads (num_blocks * num_warps * warp_size)
             self.assertLessEqual(
                 result_num_blocks * num_warps * warp_size,

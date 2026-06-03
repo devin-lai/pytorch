@@ -89,6 +89,23 @@ def get_autotuned_amd_sqr_kernel():
     )(amd_sqr_kernel)
 
 
+def _test_device_props(warp_size: int = 32) -> DeviceProperties:
+    return DeviceProperties(
+        type="cuda",
+        index=0,
+        multi_processor_count=1,
+        cc=80,
+        major=8,
+        max_threads_per_block=1024,
+        warp_size=warp_size,
+    )
+
+
+def _test_triton_config(*args, **kwargs):
+    kwargs.setdefault("device_props", _test_device_props())
+    return triton_config(*args, **kwargs)
+
+
 @instantiate_parametrized_tests
 class TestTritonHeuristics(TestCase):
     device_type = GPU_TYPE
@@ -97,7 +114,7 @@ class TestTritonHeuristics(TestCase):
         """
         Make sure block size does not exceed the maximum defined in inductor config.
         """
-        cfg = triton_config({"x": 2048, "y": 2}, 64, 64)
+        cfg = _test_triton_config({"x": 2048, "y": 2}, 64, 64)
         for label in "XYZ":
             key = f"{label}BLOCK"
             if key not in cfg.kwargs:
@@ -274,8 +291,8 @@ class TestTritonHeuristics(TestCase):
         }
 
         configs = [
-            triton_config({"x": 16}, 64),
-            triton_config({"x": 256}, 64),
+            _test_triton_config({"x": 16}, 64),
+            _test_triton_config({"x": 256}, 64),
         ]
 
         inductor_meta = {}
@@ -324,6 +341,7 @@ class TestTritonHeuristics(TestCase):
             num_stages=None,
             num_elements_per_warp=None,
             min_elem_per_thread=None,
+            device_props=None,
         ):
             seen_num_elements_per_warp.add(num_elements_per_warp)
             return None
@@ -856,14 +874,14 @@ class TestRecheckAutotuneCache(TestCase):
         recheck_autotune_cache should narrow compile_results to that single
         matching result (not skip the block due to len(configs) == 1).
         """
-        cfg = triton_config({"x": 16}, 64)
+        cfg = _test_triton_config({"x": 16}, 64)
         cfg.found_by_coordesc = False
         compile_result = self._make_compile_result(cfg)
 
         autotuner = self._make_autotuner_with_results([cfg], [compile_result])
 
         # Cache returns the same config as the best
-        cached_cfg = triton_config({"x": 16}, 64)
+        cached_cfg = _test_triton_config({"x": 16}, 64)
         cached_cfg.found_by_coordesc = True
 
         with patch(
@@ -884,8 +902,8 @@ class TestRecheckAutotuneCache(TestCase):
         When the cached best config has found_by_coordesc=True,
         it must be propagated to the compile result's config.
         """
-        cfg_a = triton_config({"x": 16}, 64)
-        cfg_b = triton_config({"x": 256}, 64)
+        cfg_a = _test_triton_config({"x": 16}, 64)
+        cfg_b = _test_triton_config({"x": 256}, 64)
         cfg_a.found_by_coordesc = False
         cfg_b.found_by_coordesc = False
         result_a = self._make_compile_result(cfg_a)
@@ -896,7 +914,7 @@ class TestRecheckAutotuneCache(TestCase):
         )
 
         # Cache says cfg_b is the best, found via coordesc
-        cached_cfg = triton_config({"x": 256}, 64)
+        cached_cfg = _test_triton_config({"x": 256}, 64)
         cached_cfg.found_by_coordesc = True
 
         with patch(
@@ -916,13 +934,13 @@ class TestRecheckAutotuneCache(TestCase):
         When the cached best config has found_by_coordesc=False, it must be
         propagated so that coordinate descent can still run if enabled.
         """
-        cfg = triton_config({"x": 16}, 64)
+        cfg = _test_triton_config({"x": 16}, 64)
         cfg.found_by_coordesc = True
         compile_result = self._make_compile_result(cfg)
 
         autotuner = self._make_autotuner_with_results([cfg], [compile_result])
 
-        cached_cfg = triton_config({"x": 16}, 64)
+        cached_cfg = _test_triton_config({"x": 16}, 64)
         cached_cfg.found_by_coordesc = False
 
         with patch(
@@ -939,8 +957,8 @@ class TestRecheckAutotuneCache(TestCase):
         """
         When there's no autotune cache hit, compile_results should not change.
         """
-        cfg_a = triton_config({"x": 16}, 64)
-        cfg_b = triton_config({"x": 256}, 64)
+        cfg_a = _test_triton_config({"x": 16}, 64)
+        cfg_b = _test_triton_config({"x": 256}, 64)
         result_a = self._make_compile_result(cfg_a)
         result_b = self._make_compile_result(cfg_b)
 
@@ -1184,7 +1202,7 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         _dynamic_scale_rblock must be a no-op when the autotune cache
         already determined the best config (cache_state == 'hit').
         """
-        cfg = triton_config({"x": 16}, 64)
+        cfg = _test_triton_config({"x": 16}, 64)
         result = self._make_compile_result(cfg)
         autotuner = self._make_autotuner_with_results([cfg], [result])
         autotuner.autotune_cache_info = {"autotune_cache_state": "hit"}
@@ -1201,7 +1219,7 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         _dynamic_scale_rblock should not be skipped when the autotune
         cache missed — this is a cold-start scenario.
         """
-        cfg = triton_config({"x": 16}, 64)
+        cfg = _test_triton_config({"x": 16}, 64)
         result = self._make_compile_result(cfg)
         autotuner = self._make_autotuner_with_results([cfg], [result])
         autotuner.autotune_cache_info = {"autotune_cache_state": "miss"}
@@ -1214,7 +1232,7 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         _dynamic_scale_rblock should not be skipped when
         autotune_cache_info is None (e.g. loaded from old pickle).
         """
-        cfg = triton_config({"x": 16}, 64)
+        cfg = _test_triton_config({"x": 16}, 64)
         result = self._make_compile_result(cfg)
         autotuner = self._make_autotuner_with_results([cfg], [result])
         autotuner.autotune_cache_info = None
@@ -1232,8 +1250,8 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         from torch._inductor.runtime.triton_heuristics import hash_configs
 
         original_configs = [
-            triton_config({"x": 1}, 16, num_stages=1),
-            triton_config({"x": 8}, 4, num_stages=1),
+            _test_triton_config({"x": 1}, 16, num_stages=1),
+            _test_triton_config({"x": 8}, 4, num_stages=1),
         ]
         configs_hash = hash_configs(original_configs)
 
@@ -1266,8 +1284,8 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
         from torch._inductor.runtime.triton_heuristics import hash_configs
 
-        cfg_a = triton_config({"x": 1}, 16, num_stages=1)
-        cfg_b = triton_config({"x": 8}, 4, num_stages=1)
+        cfg_a = _test_triton_config({"x": 1}, 16, num_stages=1)
+        cfg_b = _test_triton_config({"x": 8}, 4, num_stages=1)
         original_configs = [cfg_a, cfg_b]
         configs_hash = hash_configs(original_configs)
 
@@ -1295,7 +1313,7 @@ class TestDynamicScaleRblockCacheInteraction(TestCase):
         """
         from torch._inductor.runtime.autotune_cache import _load_cached_autotuning
 
-        original_configs = [triton_config({"x": 1}, 16, num_stages=1)]
+        original_configs = [_test_triton_config({"x": 1}, 16, num_stages=1)]
 
         best_config_data = {
             "XBLOCK": 1,
