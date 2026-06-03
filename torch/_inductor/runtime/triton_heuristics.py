@@ -3275,10 +3275,14 @@ def _enforce_reduction_config_block_minimums(
     return configs
 
 
-def _num_warps(num_warps, max_num_warps=8, min_num_warps=2, register_intensive=False):
-    # On AMD GPU each warp has 64 lanes which is double the size on NV GPU,
-    # therefore using half the number of warps here correspondingly.
-    if torch.version.hip:
+def _num_warps(
+    num_warps,
+    max_num_warps=8,
+    min_num_warps=2,
+    register_intensive=False,
+    device_props: DeviceProperties | None = None,
+):
+    if device_props is not None and device_props.warp_size_or_default() == 64:
         max_num_warps = (max_num_warps + 1) // 2
         min_num_warps = (min_num_warps + 1) // 2
     # persistent reduction is register intensive
@@ -3394,7 +3398,9 @@ def triton_config(
     # Calculate num_warps if they are not hard passed to config
     if num_warps is None:
         num_warps = _num_warps(
-            conditional_product(x, y, z) // num_elements_per_warp, min_num_warps=1
+            conditional_product(x, y, z) // num_elements_per_warp,
+            min_num_warps=1,
+            device_props=device_props,
         )
     # we are going to arrive at 2 warps only if bs was too small due to
     # numel being too small. However to workaround some ptx bugs we still
@@ -3525,9 +3531,11 @@ def triton_config_reduction(
 
     max_num_warps = 16 if r <= 8192 else 32
     if min_num_warps is not None:
-        _num_warps_func = functools.partial(_num_warps, min_num_warps=min_num_warps)
+        _num_warps_func = functools.partial(
+            _num_warps, min_num_warps=min_num_warps, device_props=device_props
+        )
     else:
-        _num_warps_func = _num_warps
+        _num_warps_func = functools.partial(_num_warps, device_props=device_props)
 
     num_warps = _num_warps_func(
         num_warps, max_num_warps=max_num_warps, register_intensive=register_intensive
@@ -3782,6 +3790,8 @@ def triton_config_tiled_reduction(
     num_stages=1,
     register_intensive=False,
     waves_per_eu=None,
+    *,
+    device_props: DeviceProperties,
 ):
     """
     Construct a tile reduction triton config with some adjustment
@@ -3812,9 +3822,14 @@ def triton_config_tiled_reduction(
         y *= 2
 
     cfg = _get_config({"x": x, "y": y, **rnumels})
-    num_warps = _num_warps(total_numel() // 256, min_num_warps=1)
     num_warps = _num_warps(
-        num_warps, max_num_warps=16, register_intensive=register_intensive
+        total_numel() // 256, min_num_warps=1, device_props=device_props
+    )
+    num_warps = _num_warps(
+        num_warps,
+        max_num_warps=16,
+        register_intensive=register_intensive,
+        device_props=device_props,
     )
     check_config(cfg, xnumel=size_hints["x"], ynumel=size_hints["y"])
     check_max_block(cfg)
@@ -4206,6 +4221,7 @@ def _reduction_configs(
                 num_stages=num_stages,
                 register_intensive=register_intensive,
                 waves_per_eu=waves_per_eu,
+                device_props=device_props,
             )
         else:
             # For other cases, use the original function
@@ -4418,6 +4434,8 @@ def adapt_config_for_tiling(
     register_intensive=False,
     persistent_reduction=False,
     waves_per_eu=None,
+    *,
+    device_props: DeviceProperties,
 ) -> Config:
     """
     Create an adapted configuration based on tiling scores,
@@ -4437,6 +4455,7 @@ def adapt_config_for_tiling(
         num_stages=num_stages,
         register_intensive=register_intensive,
         waves_per_eu=waves_per_eu,
+        device_props=device_props,
     )
 
 
@@ -4744,6 +4763,7 @@ def _persistent_reduction_configs(
                     block_sizes["x"],
                     block_sizes["y"],
                     rnumel,
+                    device_props=device_props,
                 )
             )
 
