@@ -164,6 +164,13 @@ class DeviceProperties(typing.NamedTuple):
     max_threads_per_block: int | None = None
     warp_size: int | None = None
 
+    def warp_size_or_default(self) -> int:
+        if self.warp_size is not None:
+            return self.warp_size
+        if self.type in ("cuda", "hip"):
+            raise RuntimeError(f"{self.type} device properties must report warp_size")
+        return 32
+
     @classmethod
     @functools.cache
     def create(cls, device) -> DeviceProperties:
