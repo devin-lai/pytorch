@@ -711,6 +711,7 @@ class TestInductorDynamic(DynamicShapesTestCase):
         size_hints = {"x": 600_000_000}
         x = 64
         warp_size = 64 if torch.version.hip else 32
+        # Fake device properties for this unit test; no CUDA state is needed.
         device_props = DeviceProperties(
             type="hip" if torch.version.hip else "cuda",
             index=0,
