@@ -55,6 +55,7 @@ from torch._inductor.heuristics.template.triton import (
 )
 from torch._inductor.ir import Buffer, ChoiceCaller, FixedLayout, FlexibleLayout
 from torch._inductor.kernel.mm_plus_mm import aten_mm_plus_mm
+from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner, pointwise
 from torch._inductor.scheduler import Scheduler
 from torch._inductor.select_algorithm import (
@@ -188,7 +189,18 @@ class TestMaxAutotune(TestCase):
         Verify that `max_autotune` includes all pointwise configs from
         `max_autotune_pointwise` for 1D, 2D, and 3D pointwise kernels.
         """
-        triton_meta = {"device": object()}
+        # Fake device properties for this unit test; no CUDA state is needed.
+        triton_meta = {
+            "device": DeviceProperties(
+                type="cuda",
+                index=0,
+                multi_processor_count=1,
+                cc=80,
+                major=8,
+                max_threads_per_block=1024,
+                warp_size=32,
+            )
+        }
         inductor_meta_common = {"autotune_pointwise": False}
 
         for size_hints in (
