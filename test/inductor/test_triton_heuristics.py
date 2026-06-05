@@ -1130,7 +1130,7 @@ class TestFastLauncherDeviceSupport(TestCase):
         return CachingAutotuner(
             fn=triton_,
             triton_meta=triton_meta,
-            configs=[triton_config({"x": 1}, 1)],
+            configs=[triton_config({"x": 1}, 1, device_props=device)],
             save_cache_hook=False,
             mutated_arg_names=[],
             reset_to_zero_arg_names=[],
