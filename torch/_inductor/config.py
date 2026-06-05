@@ -2839,6 +2839,12 @@ class trace:
         provenance_tracking_level = max(provenance_tracking_level, 1)
 
 
+def effective_provenance_tracking_level() -> int:
+    if trace.provenance_tracking_to_timeline:
+        return max(trace.provenance_tracking_level, 1)
+    return trace.provenance_tracking_level
+
+
 _save_config_ignore: list[str] = [
     # workaround: "Can't pickle <function ...>"
     "trace.upload_tar",
