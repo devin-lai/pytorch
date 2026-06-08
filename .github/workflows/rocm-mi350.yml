@@ -1,12 +1,15 @@
+# Unneeded for CI: trunk.yml covers the same ROCm testing.
+# Kept in-repo for metrics; auto-triggers below are commented out.
+# workflow_dispatch remains for manual runs.
 name: rocm-mi350
 
 on:
-  push:
-    tags:
-      - ciflow/rocm-mi350/*
+  #push:
+  #  tags:
+  #    - ciflow/rocm-mi350/*
   workflow_dispatch:
-  schedule:
-    - cron: 29 8 * * *  # about 1:29am PDT
+  #schedule:
+  #  - cron: 29 8 * * *  # about 1:29am PDT
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_type == 'branch' && github.sha }}-${{ github.event_name == 'workflow_dispatch' }}-${{ github.event_name == 'schedule' }}
