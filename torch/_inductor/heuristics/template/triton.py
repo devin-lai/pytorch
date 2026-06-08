@@ -1077,7 +1077,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             device = torch.cuda.current_device()
             props = torch.cuda.get_device_properties(device)
             warp_size = props.warp_size
-        except (RuntimeError, AttributeError):
+        except (RuntimeError, AttributeError, AssertionError):
             return configs
 
         pruned_configs = []
