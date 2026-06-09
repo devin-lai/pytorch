@@ -153,6 +153,9 @@ async_compile = AsyncCompile()
 # If r0_tiling_score / x_tiling_score >= this value, upgrade DEFAULT hint to INNER.
 INNER_REDUCTION_RATIO_THRESHOLD = 8
 
+# Padding option emitted on a block_ptr load whose OOB elements are zero-padded.
+BLOCK_PTR_ZERO_PADDING_OPTION = "padding_option='zero'"
+
 
 def get_triton_reduction_function(reduction_type):
     use_helper = reduction_type in ("any", "max", "min", "prod")
@@ -204,9 +207,11 @@ def _materialize_trunc_to_float_expr(
             return node
 
         new_args = tuple(
-            rewrite_float_subexpr(arg)
-            if isinstance(arg, sympy.Expr) and not is_predicate_expr(arg)
-            else arg
+            (
+                rewrite_float_subexpr(arg)
+                if isinstance(arg, sympy.Expr) and not is_predicate_expr(arg)
+                else arg
+            )
             for arg in node.args
         )
         if new_args == node.args:
@@ -1661,9 +1666,9 @@ class TritonOverrides(OpOverrides):
                 initial_shape = ["1" if dim == ZBLOCK else dim for dim in initial_shape]
 
             if final_shape == [YBLOCK, RBLOCK]:
-                assert XBLOCK not in initial_shape, (
-                    "left tl.dot operand cannot depend on x"
-                )
+                assert (
+                    XBLOCK not in initial_shape
+                ), "left tl.dot operand cannot depend on x"
 
                 shape_2d = ["1", "1"]
                 if YBLOCK in initial_shape:
@@ -1680,9 +1685,9 @@ class TritonOverrides(OpOverrides):
                     value = f"tl.broadcast_to({value}, ({YBLOCK}, {RBLOCK}))"
 
             elif final_shape == [RBLOCK, XBLOCK]:
-                assert YBLOCK not in initial_shape, (
-                    "right tl.dot operand cannot depend on y"
-                )
+                assert (
+                    YBLOCK not in initial_shape
+                ), "right tl.dot operand cannot depend on y"
 
                 shape_2d = ["1", "1"]
                 if XBLOCK in initial_shape:
@@ -2922,9 +2927,9 @@ class TMACompatibilityChecker:
                     innermost_block_symt = block_symt
                     break
 
-        assert innermost_block_type and innermost_block_symt, (
-            f"{innermost_block_shape} expr must contain a single block type from {TritonSymbols.block_types}"
-        )
+        assert (
+            innermost_block_type and innermost_block_symt
+        ), f"{innermost_block_shape} expr must contain a single block type from {TritonSymbols.block_types}"
 
         # For persistent reductions, the reduction block sizes are fixed at compile time.
         # Only apply this logic when the innermost block is a reduction block;
@@ -3836,7 +3841,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 other = ""
             elif other:
                 assert other == ", other=0.0"
-                other = f", boundary_check={check!r}, padding_option='zero'"
+                other = f", boundary_check={check!r}, {BLOCK_PTR_ZERO_PADDING_OPTION}"
             else:
                 other = f", boundary_check={check!r}"
 
@@ -3894,9 +3899,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                             continue
 
                         advancements = self.pointer_advancements[symt]
-                        assert block_descriptor not in advancements, (
-                            f"duplicate advancement for pointer '{block_descriptor}' at type '{symt}'"
-                        )
+                        assert (
+                            block_descriptor not in advancements
+                        ), f"duplicate advancement for pointer '{block_descriptor}' at type '{symt}'"
                         advancements[block_descriptor] = advance_offsets
         else:
             block_descriptor = indexing.format(var)
@@ -4219,6 +4224,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         append_broadcast = None
         shape: BlockShapeType = None
+        # Set when the block_ptr load is boundary-padded with zero, so OOB
+        # elements load as 0. Recorded as identity_padding below so a reduction
+        # over this load can skip its accumulator mask when 0 is the reduction
+        # identity (e.g. sum); for min/max (identity +/-inf) the check below
+        # leaves the mask in place since 0 != the identity.
+        block_ptr_zero_padded = False
 
         if should_unwrap_unspec_arg(name):
             line = var
@@ -4233,10 +4244,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         else:
             if isinstance(indexing, (BlockPtrOptions, TensorDescriptorOptions)):
+                # A zero `other` default plus a boundary_check makes
+                # codegen_block_ptr zero-pad OOB elements. Detect that from those
+                # two structured signals rather than matching the formatted load
+                # string (which a kwargs/quoting refactor could silently break).
+                zero_default = other == ", other=0.0"
                 block_descriptor, other = self.codegen_block_ptr(
                     name, var, indexing, other
                 )
                 if isinstance(indexing, BlockPtrOptions):
+                    block_ptr_zero_padded = zero_default and indexing.has_mask()
                     line = f"tl.load({block_descriptor}{other}{ep}{cachemod})"
                 else:
                     line = self.codegen_descriptor_load_line(block_descriptor, indexing)
@@ -4314,6 +4331,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if not self.inside_reduction or (not indexing.has_rmask() and not has_rindex):
             self.outside_loop_vars.add(result_var)
+
+        if block_ptr_zero_padded:
+            V.kernel._identity_padding_values[str(result_var)] = 0.0
 
         return result_var
 
@@ -4565,6 +4585,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         do_upcast = pytree.tree_any(lambda v: should_upcast(v.dtype), value)
         original_dtype = dtype
         original_src_dtype = src_dtype
+
+        # Look up per-load identity padding
+        identity_padding = (
+            self._identity_padding_values.get(str(value))
+            if isinstance(value, CSEVariable)
+            else None
+        )
+
         if do_upcast:
             # Only promote FB16/BF16; do not promote other integer/boolean dtypes
             value = pytree.tree_map(maybe_upcast, value)
@@ -4689,9 +4717,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             index = self.reduction_collapse_dims(
                 buffer,
                 index,
-                cast(torch.dtype, index.dtype)
-                if isinstance(index, CSEVariable)
-                else V.kernel.get_index_dtype_as_torch_dtype(),
+                (
+                    cast(torch.dtype, index.dtype)
+                    if isinstance(index, CSEVariable)
+                    else V.kernel.get_index_dtype_as_torch_dtype()
+                ),
             )
             if result_kind == "value_and_index":
                 result_value, result_index = result_var
@@ -4761,8 +4791,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             result_var.mask_vars = result_mask_vars
         cond = " & ".join(masks)
 
+        # Skip the per-iteration accumulator mask when the load already padded
+        # OOB lanes with the reduction identity (identity_padding == acc_default):
+        # combining the identity is a no-op, so the mask is redundant even for
+        # uneven tiles (OOB lanes are inert, not garbage).
+        acc_default = ir.Reduction.default_accumulator(reduction_type, src_dtype)
+        skip_accumulator_masking = (
+            not isinstance(acc_default, tuple)
+            and identity_padding is not None
+            and acc_default == identity_padding
+        )
+
         def where_cond(tval, fval):
-            if not cond:
+            if not cond or skip_accumulator_masking:
                 return tval
             return TritonKernelOverrides.where(cond, tval, fval)
 
@@ -5693,9 +5734,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.filter_masks(masks)
         masks = sorted(masks)
         assert not self._load_mask, "ops.sort not supported inside ops.masked"
-        assert self.persistent_reduction, (
-            "ops.sort is only supported in persistent reductions"
-        )
+        assert (
+            self.persistent_reduction
+        ), "ops.sort is only supported in persistent reductions"
 
         cse_compute = functools.partial(self.cse.generate, self.compute)
         dim = self.triton_tensor_ndim() - self.num_reduction_dims
@@ -5785,9 +5826,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         loop_trees = [tree for tree in self.range_trees if tree.is_loop]
         if self.mix_order_reduction:
-            assert self.persistent_reduction, (
-                "Mix order reduction requires persistent reduction"
-            )
+            assert (
+                self.persistent_reduction
+            ), "Mix order reduction requires persistent reduction"
             accumname2var = {}
             for idx, partial_accum in enumerate(self.saved_partial_accumulate):
                 reduction_type = partial_accum.reduction_type
@@ -6093,7 +6134,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             from torch._dynamo.testing import rand_strided
             {}
             import torch
-        """.format(V.graph.device_ops.import_get_raw_stream_as("get_raw_stream"))
+        """.format(
+                V.graph.device_ops.import_get_raw_stream_as("get_raw_stream")
+            )
         )
 
     def _get_heuristic(self):
@@ -7604,9 +7647,7 @@ def debug_triton_code(node: BaseSchedulerNode) -> list[str]:
         backend = node.scheduler.get_backend(device)
         assert isinstance(
             backend, (SIMDScheduling, CUDACombinedScheduling, XPUCombinedScheduling)
-        ), (
-            f"Scheduling backend should be SIMD or CUDACombined when generating debug Triton strings, got: {type(backend)}"
-        )
+        ), f"Scheduling backend should be SIMD or CUDACombined when generating debug Triton strings, got: {type(backend)}"
 
         with V.graph.set_current_device(device):
             # Don't increment kernel count when generating debug string.

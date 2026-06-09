@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import typing
+from collections.abc import Sequence
 from typing import Any, TYPE_CHECKING
 
 import sympy
@@ -474,6 +475,10 @@ class InductorChoices:
         reduction_numel_hint: int,
         numel_hint: int,
         inner_reduction: bool,
+        # Forwarded so backend overrides (e.g. MTIA) can size the split factor to
+        # the tensor dims; unused by this base heuristic.
+        ranges: Sequence[sympy.Expr] | None = None,
+        reduction_ranges: Sequence[sympy.Expr] | None = None,
     ) -> int:
         """Heuristic to decide the RSPLIT used for split reductions.
         When a reduction has a small number of outputs there is not enough parallelism,
