@@ -44,9 +44,17 @@ def load_checked_2d(
     M_LEN: tl.constexpr,
     N_LEN: tl.constexpr,
 ):
-    # Calculate final pointer if strides are provided
+    # Calculate final pointer if strides are provided. Force the offset
+    # arithmetic into int64 so that (offs * stride) does not overflow int32
+    # when the source tensor's per-row stride times the row index exceeds
+    # 2**31 (e.g. paged KV caches whose total element count is just over
+    # INT32_MAX).
     if stride_m is not None and stride_n is not None:
-        ptr = ptr + offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+        ptr = (
+            ptr
+            + offs_m[:, None].to(tl.int64) * stride_m
+            + offs_n[None, :].to(tl.int64) * stride_n
+        )
 
     # Handle all masking cases
     if not IS_DIVISIBLE_M and not IS_DIVISIBLE_N:

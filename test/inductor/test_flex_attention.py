@@ -1722,6 +1722,136 @@ class TestFlexAttention(InductorTestCase):
 
     @supported_platform
     @skip_on_cpu
+    @skip_on_mps  # CPU/MPS use a different template
+    def test_paged_kv_load_past_2gb_offset(self, device):
+        # Regression test for compiled FlexAttention with a paged KV cache
+        # whose K/V load offsets reach past the 2 GiB boundary. On AMD GPUs
+        # Triton's backend lowers `tl.load` in `load_checked_2d` into a
+        # buffer-resource load whose descriptor (`NUM_RECORDS`) is hardcoded
+        # to ~2 GiB; offsets beyond that bound silently corrupt or trap.
+        # NVIDIA uses plain 64-bit global loads with no such cap. The fix in
+        # `utilities.py.jinja` casts the offset operands to int64 which
+        # defeats the AMD buffer-resource pattern match and falls back to
+        # plain global loads. This test exercises the failing shape so any
+        # future regression is caught.
+        if device == "cuda" and not PLATFORM_SUPPORTS_BF16:
+            self.skipTest("bf16 is required for this regression test")
+
+        num_kv_heads = 8
+        head_dim = 128
+        block_size = 16
+        # Smallest num_blocks that places the high physical page's K-load
+        # byte offset past the 2 GiB AMD buffer-resource cap:
+        # last_page * block_size * num_kv_heads * head_dim * sizeof(bf16)
+        # = 131072 * 16 * 8 * 128 * 2 bytes ≈ 4.0 GiB.
+        num_blocks = 131073
+        kv_seq_len = num_blocks * block_size  # 2,097,168
+
+        if device == "cuda":
+            kv_bytes = 2 * num_kv_heads * kv_seq_len * head_dim * 2  # K + V, bf16
+            free_bytes, _ = torch.cuda.mem_get_info()
+            if free_bytes < kv_bytes + (2 << 30):
+                self.skipTest(
+                    f"need ~{(kv_bytes >> 30) + 2} GiB free GPU memory for K+V"
+                )
+
+        dtype = torch.bfloat16
+        # Allocate the natural paged layout, then reshape to the
+        # `(B=1, H_kv, S, D)` view vLLM produces. The permute makes the
+        # sequence-dim stride = num_kv_heads * head_dim (= 1024 elements
+        # here), so the high page lands at a byte offset that crosses the
+        # 2 GiB buffer-resource cap.
+        k_cache = torch.empty(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ).uniform_(-0.02, 0.02)
+        v_cache = torch.empty(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ).uniform_(-0.02, 0.02)
+        k = (
+            k_cache.view(kv_seq_len, num_kv_heads, head_dim)
+            .unsqueeze(0)
+            .permute(0, 2, 1, 3)
+        )
+        v = (
+            v_cache.view(kv_seq_len, num_kv_heads, head_dim)
+            .unsqueeze(0)
+            .permute(0, 2, 1, 3)
+        )
+        # Sanity: the high page's K-load byte offset must cross the 2 GiB
+        # AMD buffer-resource cap.
+        last_page_byte_offset = (
+            (num_blocks - 1) * block_size * num_kv_heads * head_dim * 2
+        )
+        self.assertGreater(last_page_byte_offset, 1 << 31)
+
+        num_q_heads = num_kv_heads
+        q_len = 16  # one BLOCK_M tile, keeps the test simple
+        q = torch.empty(
+            1,
+            num_q_heads,
+            q_len,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        ).uniform_(-0.02, 0.02)
+
+        # BlockMask whose single kv block references the highest physical
+        # page (`num_blocks - 1`) — the page whose byte offset crosses
+        # the 2 GiB buffer-resource cap on AMD.
+        last_page = num_blocks - 1
+        kv_indices = torch.tensor(
+            [[[[last_page]]]],
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_num_blocks = torch.ones((1, 1, 1), dtype=torch.int32, device=device)
+        block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            BLOCK_SIZE=(q_len, block_size),
+            seq_lengths=(q_len, kv_seq_len),
+            compute_q_blocks=False,
+        )
+
+        compiled = torch.compile(flex_attention, fullgraph=True, dynamic=True)
+        # Without the int64-cast fix in load_checked_2d, on AMD this aborts
+        # the process with a GPU memory access fault (the load is lowered
+        # to a buffer-resource read whose 2 GiB NUM_RECORDS bound is
+        # exceeded). With the fix it returns a finite tensor of the
+        # expected shape. The kernel options match the configuration the
+        # bug was discovered under: tile sizes equal to the mask block
+        # size, non-divisible Q/KV, and the explicit flex backend (not
+        # flash). `dynamic=True` keeps strides symbolic so the int-dtype
+        # guard is not statically resolved away.
+        out = compiled(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=False,
+            kernel_options={
+                "FORCE_USE_FLEX_ATTENTION": True,
+                "BLOCK_M": 16,
+                "BLOCK_N": 16,
+                "IS_DIVISIBLE": False,
+            },
+        )
+
+        self.assertEqual(out.shape, (1, num_q_heads, q_len, head_dim))
+        self.assertTrue(torch.isfinite(out).all())
+
+    @supported_platform
+    @skip_on_cpu
     @skip_on_mps  # hardcodes kernel_options={"BACKEND": "TRITON"}
     def test_kv_order_invariance_padded_causal(self, device):
         if device == "cuda" and not PLATFORM_SUPPORTS_BF16:
@@ -5336,7 +5466,7 @@ class GraphModule(torch.nn.Module):
         def forward(self, arg0_1: "i32[]", arg1_1: "i32[]", arg2_1: "i32[]", arg3_1: "i32[]"):
             full_default: "b8[]" = torch.ops.aten.full.default([], True, dtype = torch.bool, layout = torch.strided, device = device(type='GPU_TYPE', index=0), pin_memory = False)
             return full_default
-""".replace("GPU_TYPE", torch.device(device).type),
+""".replace("GPU_TYPE", torch.device(device).type),  # fmt: skip
         )
 
     @supported_platform
