@@ -675,6 +675,102 @@ class CondTests(TestCase):
 
     @requires_gpu
     @parametrize("device", ["cpu", GPU_TYPE])
+    def test_cond_output_input_aliasing(self, device):
+        # torch.cond branches are mutually exclusive, so returning an
+        # operand directly (output-input aliasing) is safe.
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(20, 20)
+
+            def forward(self, p, a):
+                def true_fn(x):
+                    return x
+
+                def false_fn(x):
+                    return self.linear(x)
+
+                return torch.cond(p, true_fn, false_fn, [a])
+
+        self._run_test(
+            model=Model().to(device),
+            inputs=(torch.randn(10, 20),),
+            device=device,
+            dynamic=True,
+        )
+
+    @requires_gpu
+    @parametrize("device", ["cpu", GPU_TYPE])
+    def test_cond_output_input_aliasing_multi_output(self, device):
+        # One of multiple outputs aliases the input — compile + numerical check.
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(20, 10)
+
+            def forward(self, p, a):
+                def true_fn(x):
+                    return x, self.linear(x)
+
+                def false_fn(x):
+                    return x.new_zeros(x.shape), x.new_zeros(x.shape[0], 10)
+
+                out1, out2 = torch.cond(p, true_fn, false_fn, [a])
+                return out1 + out2.sum(dim=1, keepdim=True).expand_as(out1)
+
+        model = Model().to(device)
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        a = torch.randn(10, 20, device=device)
+        for p_val in [True, False]:
+            p = torch.tensor(p_val, device=device)
+            expected = model(p, a)
+            actual = compiled(p, a)
+            torch.testing.assert_close(actual, expected)
+
+    @requires_gpu
+    @parametrize("device", ["cpu", GPU_TYPE])
+    def test_cond_output_input_aliasing_both_branches(self, device):
+        # Both branches return the input directly (identity cond).
+        class Model(torch.nn.Module):
+            def forward(self, p, a):
+                def true_fn(x):
+                    return x
+
+                def false_fn(x):
+                    return x
+
+                return torch.cond(p, true_fn, false_fn, [a])
+
+        model = Model().to(device)
+        compiled = torch.compile(model, backend="inductor", fullgraph=True)
+        a = torch.randn(10, 20, device=device)
+        for p_val in [True, False]:
+            p = torch.tensor(p_val, device=device)
+            expected = model(p, a)
+            actual = compiled(p, a)
+            torch.testing.assert_close(actual, expected)
+
+    def test_cond_input_mutation_still_rejected(self):
+        # Mutation must still be rejected even though aliasing is allowed.
+        class Model(torch.nn.Module):
+            def forward(self, p, a):
+                def true_fn(x):
+                    x.add_(1)
+                    return x
+
+                def false_fn(x):
+                    return x
+
+                return torch.cond(p, true_fn, false_fn, [a])
+
+        with self.assertRaises(Exception):
+            torch.compile(Model())(
+                torch.tensor(True),
+                torch.randn(10, 20),
+            )
+
+    @requires_gpu
+    @parametrize("device", ["cpu", GPU_TYPE])
     def test_cond_decompose_ops_in_subgraph(self, device):
         class Model(torch.nn.Module):
             def forward(self, p, a):
