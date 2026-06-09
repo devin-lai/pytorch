@@ -1188,5 +1188,65 @@ class TestRunnerDeterminatorArcExperiment(TestCase):
         self.assertEqual(set(), rd.parse_workflow_list(""))
 
 
+class TestRunnerDeterminatorDoExperiment(TestCase):
+    DO_SETTINGS = """
+        experiments:
+            do:
+                rollout_perc: 0
+        ---
+
+        Users:
+        @User1,do
+        @User2,lf
+
+        """
+
+    def test_do_opted_in_user_returns_do_prefix(self) -> None:
+        result = rd.get_runner_prefix(self.DO_SETTINGS, ["User1"], USER_BRANCH)
+        self.assertEqual("do-", result.do_prefix)
+        # do is exposed via its own output, not folded into the shared prefix
+        self.assertEqual("", result.prefix)
+
+    def test_do_not_enabled_returns_empty_do_prefix(self) -> None:
+        result = rd.get_runner_prefix(self.DO_SETTINGS, ["User2"], USER_BRANCH)
+        self.assertEqual("", result.do_prefix)
+        self.assertEqual("", result.prefix)
+
+    def test_do_with_arc_keeps_both(self) -> None:
+        settings_text = """
+        experiments:
+            arc:
+                rollout_perc: 0
+            do:
+                rollout_perc: 0
+        ---
+
+        Users:
+        @User1,arc,do
+
+        """
+        result = rd.get_runner_prefix(settings_text, ["User1"], USER_BRANCH)
+        self.assertEqual("mt-", result.prefix)
+        self.assertTrue(result.use_arc)
+        self.assertEqual("do-", result.do_prefix)
+
+    def test_do_with_lf_keeps_both(self) -> None:
+        settings_text = """
+        experiments:
+            lf:
+                rollout_perc: 0
+            do:
+                rollout_perc: 0
+        ---
+
+        Users:
+        @User1,lf,do
+
+        """
+        result = rd.get_runner_prefix(settings_text, ["User1"], USER_BRANCH)
+        self.assertEqual("lf.", result.prefix)
+        self.assertEqual("do-", result.do_prefix)
+
+
 if __name__ == "__main__":
     main()
