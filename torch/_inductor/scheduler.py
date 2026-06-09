@@ -285,10 +285,13 @@ class MixOrderReduction:
         var_ranges = node.read_writes.var_ranges
 
         if not var_ranges:
-            assert isinstance(node, FusedSchedulerNode), f"{type(node)}"
+            if not isinstance(node, FusedSchedulerNode):
+                return False
             var_ranges = node.snodes[0].read_writes.var_ranges
 
-        assert var_ranges
+        # Range-less reads cannot prove full access over this node's loop domain.
+        if not var_ranges:
+            return False
         if not (OrderedSet(var_ranges) - OrderedSet(index.free_symbols)):
             return True
 
