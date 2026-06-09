@@ -6187,13 +6187,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if flops is not None:
                 out["kernel_flop"] = flops
         if self.host_tma_descriptor_args:
-            # Pass {inner_arg: [block_dim_str, ...]} to the per-config
-            # launcher so it can call TensorDescriptor.from_tensor() with
-            # the actual autotuned XBLOCK / YBLOCK values (issue #185819).
-            out["host_tma_descriptor_args"] = {
-                inner: [str(s) for s in opts.block_shape]
-                for inner, opts in self.host_tma_descriptor_args.items()
-            }
+            # Pass descriptor info to the per-config launcher so it can
+            # create TensorDescriptors before kernel launch (issue #185819).
+            meta_args = {}
+            for inner, opts in self.host_tma_descriptor_args.items():
+                if isinstance(opts, dict):
+                    meta_args[inner] = opts
+                elif hasattr(opts, "block_shape"):
+                    meta_args[inner] = {
+                        "block_shape": [str(s) for s in opts.block_shape],
+                    }
+                else:
+                    meta_args[inner] = {
+                        "block_shape": [str(s) for s in opts],
+                    }
+            out["host_tma_descriptor_args"] = meta_args
         return out
 
     @functools.cached_property

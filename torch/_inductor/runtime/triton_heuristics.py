@@ -2776,17 +2776,32 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
         pre_runner_lines: list[str] = []
         if host_tma_args:
             cfg_kwargs = cfg.kwargs
-            for inner_name, block_shape_strs in host_tma_args.items():
+            for inner_name, info in host_tma_args.items():
                 if inner_name not in call_args:
                     continue
+                if isinstance(info, dict):
+                    block_shape_strs = info["block_shape"]
+                    dim_order = info.get("dim_order")
+                else:
+                    block_shape_strs = info
+                    dim_order = None
                 block_shape_vals = [
                     cfg_kwargs.get(s, s) for s in block_shape_strs
                 ]
                 desc_var = f"{inner_name}_host_tma_desc"
-                pre_runner_lines.append(
-                    f"{desc_var} = triton.tools.tensor_descriptor"
-                    f".TensorDescriptor.from_tensor({inner_name}, {block_shape_vals})"
-                )
+                if dim_order and dim_order != list(range(len(dim_order))):
+                    pre_runner_lines.append(
+                        f"{desc_var} = triton.tools.tensor_descriptor"
+                        f".TensorDescriptor({inner_name},"
+                        f" [{', '.join(f'{inner_name}.shape[{d}]' for d in dim_order)}],"
+                        f" [{', '.join(f'{inner_name}.stride({d})' for d in dim_order)}],"
+                        f" {block_shape_vals})"
+                    )
+                else:
+                    pre_runner_lines.append(
+                        f"{desc_var} = triton.tools.tensor_descriptor"
+                        f".TensorDescriptor.from_tensor({inner_name}, {block_shape_vals})"
+                    )
                 runner_args = [
                     desc_var if a == inner_name else a for a in runner_args
                 ]
