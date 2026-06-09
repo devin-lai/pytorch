@@ -287,10 +287,20 @@ class MixOrderReduction:
         if not var_ranges:
             if not isinstance(node, FusedSchedulerNode):
                 return False
+            # FusedSchedulerNode.read_writes is produced by ReadWrites.merge_list(),
+            # which intentionally drops var_ranges because fused children can have
+            # different loop domains. Preserve the existing best-effort fallback to
+            # the first child, but do not require that child to have ranges either.
             var_ranges = node.snodes[0].read_writes.var_ranges
 
-        # Range-less reads cannot prove full access over this node's loop domain.
         if not var_ranges:
+            # Missing ranges are still valid here: scalar or fully unrolled nodes
+            # have no loop variables to record. For example,
+            # test_comprehensive_masked_cumprod_cuda_float32 can produce a fused
+            # node whose first child only has constant-indexed reads. Since this
+            # helper only proves a MixOrderReduction fusion opportunity, decline
+            # the proof instead of turning an optional fusion miss into a
+            # compilation failure.
             return False
         if not (OrderedSet(var_ranges) - OrderedSet(index.free_symbols)):
             return True
