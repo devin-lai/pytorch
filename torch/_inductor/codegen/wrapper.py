@@ -2110,6 +2110,7 @@ class PythonWrapperCodegen(CodeGen):
         self.writeline(line)
 
     def define_extern_kernel_profile_wrapper(self, kernel_name: str, suffix: str):
+        """Wrap extern calls so profiler events use names with provenance metadata."""
         wrapper_kernel_name = re.sub(
             r"\W",
             "_",
@@ -2118,6 +2119,9 @@ class PythonWrapperCodegen(CodeGen):
         inductor_debug.alias_kernel_provenance(kernel_name, wrapper_kernel_name)
         self.header.splice(f"def {wrapper_kernel_name}(*args, **kwargs):")
         with self.header.indent():
+            self.header.splice(
+                "# Extra indirection is only enabled for profiler timeline provenance."
+            )
             self.header.splice(f"return {kernel_name}(*args, **kwargs)")
         return wrapper_kernel_name
 
