@@ -3887,6 +3887,71 @@ def _wrap_graph_break_with_torch_runtime_err(gb_fn: Callable[[], NoReturn]) -> N
     raise AssertionError("should be unreachable")
 
 
+def _has_exception_handler(tx: InstructionTranslatorBase) -> bool:
+    """
+    Check if the current instruction is inside a try-except block that can catch exceptions.
+    """
+    instructions = tx.instructions
+    offset_to_index = {inst.offset: i for i, inst in enumerate(instructions)}
+
+    def check_exc_match_newer_python(target_offset: int) -> bool:
+        start = offset_to_index.get(target_offset)
+        if start is None:
+            return False
+
+        for j in range(start, len(instructions)):
+            opname = instructions[j].opname
+            if opname in ("CHECK_EXC_MATCH", "CHECK_EG_MATCH"):
+                return True
+            if opname in ("RERAISE", "RETURN_VALUE", "RETURN_CONST", "POP_EXCEPT"):
+                if j > start:
+                    return False
+        return False
+
+    def check_exc_match_older_python(target_offset: int) -> bool:
+        start = offset_to_index.get(target_offset)
+        if start is None:
+            return False
+
+        for j in range(start, len(instructions)):
+            opname = instructions[j].opname
+            if opname == "JUMP_IF_NOT_EXC_MATCH":
+                return True
+            if opname in ("RERAISE", "POP_EXCEPT"):
+                if j > start:
+                    return False
+        return False
+
+    def _check_exception_handler_recursive(
+        current_entry: Any, visited_targets: set[int]
+    ) -> bool:
+        if current_entry is None:
+            return False
+
+        target_offset = current_entry.target.offset
+        if target_offset in visited_targets:
+            return False
+
+        visited_targets.add(target_offset)
+        if check_exc_match_newer_python(target_offset):
+            return True
+
+        next_entry = current_entry.target.exn_tab_entry
+        return _check_exception_handler_recursive(next_entry, visited_targets)
+
+    if sys.version_info >= (3, 11):
+        current_entry = tx.current_instruction.exn_tab_entry
+        visited_targets: set[int] = set()
+        return _check_exception_handler_recursive(current_entry, visited_targets)
+    else:
+        for block_entry in tx.block_stack:
+            if block_entry.inst.opname == "SETUP_FINALLY":
+                target_offset = block_entry.inst.target.offset
+                if check_exc_match_older_python(target_offset):
+                    return True
+        return False
+
+
 def get_fake_value(
     node: torch.fx.Node,
     tx: InstructionTranslatorBase,
@@ -4087,10 +4152,26 @@ def _get_fake_value_impl(
             )
 
         msg = get_concrete_sizes_from_symints(str(e), fake_mode)
-        tx.output.graph.erase_node(node)
-        from .exc import raise_observed_exception
 
-        raise_observed_exception(RuntimeError, tx, args=[msg])
+        # Check if user has exception handler for this RuntimeError
+        if _has_exception_handler(tx):
+            # Use ObservedException for full-graph compilation
+            tx.output.graph.erase_node(node)
+            from .exc import raise_observed_exception
+
+            raise_observed_exception(RuntimeError, tx, args=[msg])
+        else:
+            # No handler - use graph break with TorchRuntimeError
+            _wrap_graph_break_with_torch_runtime_err(
+                lambda: unimplemented(
+                    gb_type="RuntimeError when making fake tensor call",
+                    context="",
+                    explanation=msg,
+                    hints=[*graph_break_hints.USER_ERROR],
+                    from_exc=cause,
+                )
+            )
+            raise AssertionError("should not be reachable") from None
 
     if not allow_non_graph_fake:
         _ = pytree.tree_map_only(
